@@ -13,11 +13,14 @@ const queue = {
     Supp: []
 };
 
+const queueChannels  = {
+
+}
+
 const test = () => {
 	queue.Top.push('user1');
 	queue.Jg.push('user2');
 	queue.Mid.push('user3');
-	queue.Adc.push('user4');
 	queue.Supp.push('user5');
 	queue.Top.push('user6');
 	queue.Jg.push('user7');
@@ -34,14 +37,14 @@ const reset = async (channel) => {
 	await writeCustomQueue(channel);
 }
 
-const moveUsersToVoiceChannel = async (guild, config, voiceChannel) => {
+const moveUsersToVoiceChannel = async (guild, voiceChannel, from) => {
 	if (!voiceChannel) {
 		return;
 	}
 	for (const role in queue) {
 		for (const userId of queue[role]) {
 			const member = guild.members.cache.get(userId);
-			if (member && member.voice.channel && member.voice.channel.id === config.botVCchannel) {
+			if (member && member.voice.channel && member.voice.channel.id === from) {
 				await moveUserToChannel(member, voiceChannel);
 			}
 		}
@@ -155,6 +158,7 @@ const writeCustomQueue = async (channel, client) => {
 		}
 	});
 	collector.on('end', async (collected, reason) => {
+		const queueNumber = config.QueueNumber || 1;
 		if (reason === 'Queue is full') {
 			const mess = await channel.send({ content: 'The queue is now full! Starting the game...' });
 			setTimeout(async () => {
@@ -163,30 +167,24 @@ const writeCustomQueue = async (channel, client) => {
 
 			//--------------------------------------------
 
-			const category = await createCategory(channel.guild, `Queue #${config.QueueNumber}`);
-			await moveCategoryToBottom(category);
-			const queueChannels  ={
-				text: await createTextChannel(channel.guild, category, 'Queue #' + config.QueueNumber),
-				voice: await createVoiceChannel(channel.guild, category, 'Queue VC #' + config.QueueNumber)
-			}
+			queueChannels['category' + queueNumber ] = await createCategory(channel.guild, `Queue #${queueNumber}`);
+			await moveCategoryToBottom(queueChannels['category' + queueNumber]);
+
+			queueChannels['text' + queueNumber] = await createTextChannel(channel.guild, queueChannels['category' + queueNumber], 'Queue #' + queueNumber),
+			queueChannels['voice' + queueNumber] = await createVoiceChannel(channel.guild, queueChannels['category' + queueNumber], 'Queue VC #' + queueNumber)
 			
 			//--------------------------------------------
 
-			await moveUsersToVoiceChannel(channel.guild, config, queueChannels.voice);
+			await moveUsersToVoiceChannel(channel.guild, queueChannels['voice' + queueNumber], config.botVCchannel);
 
 			//--------------------------------------------
 
 			try {
-				await draftStart(queue, config, queueChannels, channel.guild, client);
+				await draftStart(queue, config, queueChannels, channel.guild, queueNumber);
 			}
 			catch (err) {
-				await queueChannels.text.send({ content: err.message });
-				await wait(10000);
-				await queueChannels.text.delete();
-				await queueChannels.voice.delete();
-				await category.delete();
-				reset(channel);
-				return;
+				await queueChannels['text' + queueNumber].send({ content: err.message });
+				await wait(30000);
 			}
 			//config.QueueNumber += 1;
 			//await config.save();
@@ -194,6 +192,11 @@ const writeCustomQueue = async (channel, client) => {
 		} else {
 			await channel.send({ content: 'Queue collection ended.' });
 		}
+		await wait(30000);
+		await moveUsersToVoiceChannel(channel.guild, channel.guild.channels.cache.get(config.botVCchannel), queueChannels['voice' + queueNumber].id);
+		if (queueChannels['text' + queueNumber]) await queueChannels['text' + queueNumber].delete();
+		if (queueChannels['voice' + queueNumber]) await queueChannels['voice' + queueNumber].delete();
+		if (queueChannels['category' + queueNumber]) await queueChannels['category' + queueNumber].delete();
 		reset(channel);
 	});
 };

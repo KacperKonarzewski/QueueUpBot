@@ -3,6 +3,7 @@ const { Client, Collection, GatewayIntentBits, MessageFlags  } = require('discor
 const mongoose = require('mongoose');
 const { addPlayerIfNotExists } = require('./src/playerManager');
 const { writeCustomQueue } = require('./src/customManager');
+const { deployCommandsForGuild } = require('./deploy-commands');
 const fs = require('fs');
 const path = require('path');
 const Config = require('./models/Config');
@@ -50,7 +51,12 @@ client.on('guildCreate', async guild => {
 
 	const defaultChannel = guild.channels.cache.find(c => c.type === 0 && c.permissionsFor(guild.members.me).has('SendMessages'));
 	if (defaultChannel) {
-		await defaultChannel.send("Hello! I'm QueueUpBot. Use /setchannel to set the bot channel and /setvc to set the voice channel and then use /start to create a custom queue.");
+		try {
+			await deployCommandsForGuild(guild.id);
+			await defaultChannel.send("Hello! I'm QueueUpBot. Use /setchannel to set the bot channel and /setvc to set the voice channel and then use /start to create a custom queue.");
+		} catch (err) {
+			await defaultChannel.send("❌ An error occurred while setting up the bot. Please try again later.");
+		}
 	}
 });
 
@@ -68,6 +74,7 @@ client.once('ready', async () => {
 			await Config.create({ serverID: guild.id });
 		}
 		try {
+			await deployCommandsForGuild(guild.id);
 			const botChannel = guild.channels.cache.get(config.botChannel);
 			const voiceChannel = guild.channels.cache.get(config.botVCchannel);
 			if (!botChannel || !voiceChannel) {
