@@ -1,4 +1,4 @@
-const { ComponentType, ChannelType, MessageFlags } = require('discord.js');
+const { ComponentType, ChannelType, MessageFlags, PermissionsBitField, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const Config = require('../models/Config');
 const { applyMatchResult } = require('./playerManager');
 const {
@@ -30,6 +30,12 @@ const fetchMember = async (guild, userId) => {
 	return guild.members.cache.get(userId) ?? (await guild.members.fetch(userId).catch(() => null));
 };
 const maybeNumber = (n, fallback) => (typeof n === 'number' && Number.isFinite(n) ? n : fallback);
+const isAdmin = (member) => {
+	return !!(
+		member?.permissions?.has?.(PermissionsBitField.Flags.Administrator) ||
+		member?.roles?.cache?.has?.('1386385941278621894')
+	);
+};
 
 /* --------------------------------------------
  * Ephemeral helpers (auto-delete via webhook)
@@ -144,13 +150,69 @@ function removeUserFromQueue(queue, userId) {
 }
 
 /* --------------------------------------------
+ * Admin kick helpers
+ * ------------------------------------------ */
+
+function listQueuedWithRoles(queue) {
+	const out = [];
+	for (const role of Object.keys(queue)) {
+		for (const id of queue[role]) out.push({ id, role });
+	}
+	return out;
+}
+
+function buildAdminRow() {
+	return new ActionRowBuilder().addComponents(
+		new ButtonBuilder()
+			.setCustomId('admin_kick_panel')
+			.setLabel('Manage Queue')
+			.setStyle(ButtonStyle.Danger)
+			.setEmoji('🧹')
+	);
+}
+
+function buildKickPanelComponents(guild, queue) {
+	// Up to 10 players; 5 per row limit
+	const entries = listQueuedWithRoles(queue);
+	const rows = [];
+	let row = new ActionRowBuilder();
+
+	for (let i = 0; i < entries.length; i++) {
+		const { id, role } = entries[i];
+		const m = guild.members.cache.get(id);
+		const label = (m?.displayName || m?.user?.username || id).slice(0, 80);
+		if (row.components.length === 5) {
+			rows.push(row);
+			row = new ActionRowBuilder();
+		}
+		row.addComponents(
+			new ButtonBuilder()
+				.setCustomId(`kick:${id}`)
+				.setLabel(`${label} — ${role}`)
+				.setStyle(ButtonStyle.Danger)
+		);
+	}
+	if (row.components.length) rows.push(row);
+
+	// Add a close/cancel row if we have space
+	const closeRow = new ActionRowBuilder().addComponents(
+		new ButtonBuilder()
+			.setCustomId('kick_close')
+			.setLabel('Close')
+			.setStyle(ButtonStyle.Secondary)
+	);
+	if (rows.length < 5) rows.push(closeRow);
+	return rows;
+}
+
+/* --------------------------------------------
  * UI creation / bumping (NO RESET)
  * ------------------------------------------ */
 
 async function createQueueMessage(channel, config, queue) {
 	const msg = await channel.send({
 		embeds: [generateQueue(queue, config)],
-		components: [createButtons()],
+		components: [createButtons(), buildAdminRow()],
 	});
 	// Persist last message id
 	config.lastQueueMessageID = msg.id;
@@ -166,12 +228,88 @@ function attachQueueCollector(queueMessage, { serverID, queueNumber, queue, conf
 	const lock = getLock(`${serverID}:${queueNumber}`);
 
 	collector.on('collect', async (i) => {
-		if (!['join_queue', 'leave_queue'].includes(i.customId)) return;
 		const userId = i.user.id;
 
+		// Ack fast
 		if (!i.deferred && !i.replied) {
 			await i.deferUpdate().catch(() => {});
 		}
+
+		// --- ADMIN KICK PANEL OPEN ---
+		if (i.customId === 'admin_kick_panel') {
+			if (!isAdmin(i.member)) {
+				await sendEphemeral(i, { content: '❌ You must be an admin to manage the queue.' }, maybeNumber(config.DeleteShortMs, 2000));
+				return;
+			}
+			const rows = buildKickPanelComponents(i.guild, queue);
+			if (rows.length === 0) {
+				await sendEphemeral(i, { content: 'ℹ️ Queue is empty.' }, maybeNumber(config.DeleteShortMs, 2000));
+				return;
+			}
+			const panel = await sendEphemeral(i, {
+				content: '🧹 **Admin panel** — click a player to remove them from the queue:',
+				components: rows
+			}, null);
+
+			if (!panel) return;
+
+			const userCollector = panel.createMessageComponentCollector({
+				componentType: ComponentType.Button,
+				time: maybeNumber(config.DeleteMediumMs, 5000) + 20000, // ~25s panel lifetime
+				filter: (ii) => ii.user.id === userId,
+			});
+
+			userCollector.on('collect', async (ii) => {
+				// Only the admin who opened can use
+				if (ii.customId === 'kick_close') {
+					// Close panel by deleting the ephemeral
+					try { await ii.update({ content: '✅ Closed.', components: [] }); } catch {}
+					deleteEphemeralBy(i, panel, maybeNumber(config.DeleteShortMs, 2000));
+					return;
+				}
+				const [kind, targetId] = ii.customId.split(':');
+				if (kind !== 'kick' || !targetId) {
+					await ii.deferUpdate().catch(() => {});
+					return;
+				}
+
+				await lock.run(async () => {
+					// Remove target from any role
+					const removed = removeUserFromQueue(queue, targetId);
+					if (removed) {
+						// Update main message
+						await queueMessage.edit({
+							embeds: [generateQueue(queue, config)],
+							components: [createButtons(), buildAdminRow()],
+						}).catch(() => {});
+
+						// Update the panel UI (rebuild list)
+						const newRows = buildKickPanelComponents(ii.guild, queue);
+						if (newRows.length === 0) {
+							// No more players, close panel
+							try { await ii.update({ content: '✅ Removed. Queue is now empty.', components: [] }); } catch {}
+							deleteEphemeralBy(i, panel, maybeNumber(config.DeleteShortMs, 2000));
+						} else {
+							try {
+								await ii.update({
+									content: `✅ Removed <@${targetId}> from the queue.\nClick another to remove:`,
+									components: newRows
+								});
+							} catch {}
+						}
+					} else {
+						try {
+							await ii.reply({ content: '⚠️ That user is not in the queue anymore.', flags: MessageFlags.Ephemeral });
+						} catch {}
+					}
+				});
+			});
+
+			return; // handled
+		}
+
+		// --- NORMAL JOIN/LEAVE ---
+		if (!['join_queue', 'leave_queue'].includes(i.customId)) return;
 
 		await lock.run(async () => {
 			let needsEdit = true;
@@ -239,7 +377,7 @@ function attachQueueCollector(queueMessage, { serverID, queueNumber, queue, conf
 			if (needsEdit) {
 				await queueMessage.edit({
 					embeds: [generateQueue(queue, config)],
-					components: [createButtons()],
+					components: [createButtons(), buildAdminRow()],
 				}).catch(() => {});
 			}
 
@@ -341,7 +479,7 @@ async function bumpQueueUI(channel) {
 }
 
 /* --------------------------------------------
- * Queue full -> play flow (unchanged, references existing state)
+ * Queue full -> play flow
  * ------------------------------------------ */
 
 async function onQueueFullFlow({ channel, config, serverID, queueNumber }) {
@@ -371,7 +509,6 @@ async function onQueueFullFlow({ channel, config, serverID, queueNumber }) {
 	};
 
 	try {
-		// Reuse lobby VC's parent category if present
 		const lobbyVC = channel.guild.channels.cache.get(config.botVCchannel);
 		const parentCategory =
 			lobbyVC?.parent ?? (lobbyVC?.parentId ? channel.guild.channels.cache.get(lobbyVC.parentId) : null);
@@ -400,7 +537,6 @@ async function onQueueFullFlow({ channel, config, serverID, queueNumber }) {
 
 			await safeDelete(queueChannels.voice);
 
-			// Prepare next queue number but do NOT render/bump here
 			config.QueueNumber += 1;
 			await config.save().catch(() => {});
 			state.queues.set(config.QueueNumber, makeEmptyQueue());
@@ -460,6 +596,6 @@ async function onQueueFullFlow({ channel, config, serverID, queueNumber }) {
  * Exports
  * ------------------------------------------ */
 module.exports = {
-	writeCustomQueue,   // call once to initialize a queue session for the current QueueNumber
-	bumpQueueUI,        // call on messageCreate in botChannel to keep the UI at bottom (no reset)
+	writeCustomQueue,
+	bumpQueueUI,
 };
