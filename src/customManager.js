@@ -35,8 +35,6 @@ const maybeNumber = (n, fallback) => (typeof n === 'number' && Number.isFinite(n
  * Ephemeral helpers (auto-delete)
  * ------------------------------------------ */
 
-// Sends an ephemeral follow-up/reply and auto-deletes it after ttlMs.
-// Works for BOTH command and component interactions.
 async function sendEphemeral(i, payload, ttlMs) {
 	const opts = { ...payload, flags: MessageFlags.Ephemeral, fetchReply: true };
 	let msg = null;
@@ -51,7 +49,6 @@ async function sendEphemeral(i, payload, ttlMs) {
 	}
 	if (ttlMs) {
 		setTimeout(() => {
-			// Prefer deleteReply when we own the latest reply; otherwise fallback to webhook delete by id.
 			i.deleteReply?.().catch(() => {
 				i.webhook?.deleteMessage?.(msg.id).catch(() => {});
 			});
@@ -60,11 +57,9 @@ async function sendEphemeral(i, payload, ttlMs) {
 	return msg;
 }
 
-// For a nested interaction (like roleInteraction), send ephemeral reply + auto-delete
 async function replyEphemeral(interaction, payload, ttlMs) {
 	let msg = null;
 	try {
-		// fetchReply: true guarantees we get a Message; delete via deleteReply() is most reliable here
 		msg = await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral, fetchReply: true });
 	} catch {
 		return null;
@@ -79,7 +74,6 @@ async function replyEphemeral(interaction, payload, ttlMs) {
 	return msg;
 }
 
-// Delete a previously sent ephemeral message (from the parent interaction that created it)
 function deleteEphemeralBy(webhookOwnerInteraction, msg, delayMs = 0) {
 	if (!msg?.id || !webhookOwnerInteraction?.webhook) return;
 	setTimeout(() => {
@@ -98,7 +92,7 @@ class Mutex {
 		return p;
 	}
 }
-const locks = new Map(); // key -> Mutex
+const locks = new Map();
 const getLock = (key) => {
 	if (!locks.has(key)) locks.set(key, new Mutex());
 	return locks.get(key);
@@ -106,7 +100,6 @@ const getLock = (key) => {
 
 /* --------------------------------------------
  * In-memory per-guild/per-queue state
- * serverID -> { queues: Map<number, Queue>, channels: Map<number, Channels>, matches: Map<number, Matches> }
  * ------------------------------------------ */
 const globalState = new Map();
 function getGuildState(serverID) {
@@ -205,7 +198,6 @@ async function writeCustomQueue(channel) {
 		if (!['join_queue', 'leave_queue'].includes(i.customId)) return;
 		const userId = i.user.id;
 
-		// ✅ Ack within 3s to avoid "Interaction failed"
 		if (!i.deferred && !i.replied) {
 			await i.deferUpdate().catch(() => {});
 		}
@@ -214,28 +206,24 @@ async function writeCustomQueue(channel) {
 			let needsEdit = true;
 
 			if (i.customId === 'join_queue') {
-				// Already queued?
 				if (Object.values(queue).flat().includes(userId)) {
 					await sendEphemeral(i, { content: '❌ You are already in the queue!' }, deleteShortMs);
 					return;
 				}
-				// Already full?
 				if (isQueueFull(queue, perRoleCap)) {
 					await sendEphemeral(i, { content: '❌ The queue is already full!' }, deleteShortMs);
 					return;
 				}
 
-				// Send ephemeral role picker as follow-up
 				const rolePromptMsg = await sendEphemeral(
 					i,
 					{
 						content: 'Choose your role:',
 						components: [createRoleButtons(queue, perRoleCap)],
 					},
-					/* ttl */ null // we'll delete after selection/timeout
+					null
 				);
 
-				// Await only on THIS ephemeral prompt’s buttons, from the same user
 				const roleInteraction = rolePromptMsg
 					? await rolePromptMsg.awaitMessageComponent({
 						componentType: ComponentType.Button,
@@ -244,7 +232,6 @@ async function writeCustomQueue(channel) {
 					}).catch(() => null)
 					: null;
 
-				// Remove the role picker prompt (if it exists)
 				deleteEphemeralBy(i, rolePromptMsg, 0);
 
 				if (!roleInteraction) {
@@ -254,7 +241,6 @@ async function writeCustomQueue(channel) {
 
 				const role = roleInteraction.customId.replace('role_', '');
 
-				// Re-check just before push (race-safe)
 				if (Object.values(queue).flat().includes(userId)) {
 					await replyEphemeral(roleInteraction, { content: '❌ You are already in the queue!' }, deleteShortMs);
 					needsEdit = false;
@@ -272,8 +258,6 @@ async function writeCustomQueue(channel) {
 				}
 
 				queue[role].push(userId);
-
-				// ✅ This one will now auto-disappear
 				await replyEphemeral(roleInteraction, { content: `✅ You joined as ${role}!` }, deleteShortMs);
 			} else if (i.customId === 'leave_queue') {
 				const removed = removeUserFromQueue(queue, userId);
@@ -298,25 +282,37 @@ async function writeCustomQueue(channel) {
 	});
 
 	collector.on('end', async (_collected, reason) => {
-		const cleanupAll = async () => {
+		const cleanupAll = async (createdCategory) => {
 			await wait(deleteLongMs);
 			await safeDelete(queueChannels.text);
-			await safeDelete(queueChannels.category);
+			if (createdCategory) await safeDelete(queueChannels.category);
 			globalState.get(serverID)?.queues?.delete(queueNumber);
 			globalState.get(serverID)?.channels?.delete(queueNumber);
 			globalState.get(serverID)?.matches?.delete(queueNumber);
 		};
 
 		if (reason !== 'Queue is full') {
-			return cleanupAll();
+			return cleanupAll(false);
 		}
 
 		const mess = await channel.send({ content: 'The queue is now full! Starting the game...' }).catch(() => null);
 		setTimeout(async () => { try { if (mess) await mess.delete(); } catch {} }, deleteMediumMs);
 
+		let createdCategory = false;
+
 		try {
-			queueChannels.category = await createCategory(channel.guild, `Queue #${queueNumber}`);
-			await moveCategoryToBottom?.(channel.guild, queueChannels.category).catch(() => {});
+			const lobbyVC = channel.guild.channels.cache.get(config.botVCchannel);
+			const parentCategory =
+				lobbyVC?.parent ?? (lobbyVC?.parentId ? channel.guild.channels.cache.get(lobbyVC.parentId) : null);
+
+			if (parentCategory && parentCategory.type === ChannelType.GuildCategory) {
+				queueChannels.category = parentCategory;
+			} else {
+				queueChannels.category = await createCategory(channel.guild, `Queue #${queueNumber}`);
+				createdCategory = true;
+				await moveCategoryToBottom?.(channel.guild, queueChannels.category).catch(() => {});
+			}
+
 			queueChannels.text = await createTextChannel(channel.guild, queueChannels.category, `Queue #${queueNumber}`);
 			queueChannels.voice = await createVoiceChannel(channel.guild, queueChannels.category, `Queue VC #${queueNumber}`);
 
@@ -387,13 +383,13 @@ async function writeCustomQueue(channel) {
 				await safeDelete(queueChannels.voice);
 				await safeDelete(matches.blue);
 				await safeDelete(matches.red);
-				await safeDelete(queueChannels.category);
-
+				if (createdCategory) await safeDelete(queueChannels.category);
+				
 				state.queues.set(queueNumber, makeEmptyQueue());
 				return;
 			}
 		} finally {
-			await cleanupAll();
+			await cleanupAll(createdCategory);
 		}
 	});
 }
