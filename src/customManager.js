@@ -32,43 +32,41 @@ const fetchMember = async (guild, userId) => {
 const maybeNumber = (n, fallback) => (typeof n === 'number' && Number.isFinite(n) ? n : fallback);
 
 /* --------------------------------------------
- * Ephemeral helpers (auto-delete)
+ * Ephemeral helpers (auto-delete via webhook)
  * ------------------------------------------ */
 
+// Always create an EPHEMERAL FOLLOW-UP when possible and delete by id via webhook.
+// Never use deleteReply() here (can nuke the source message when deferred).
 async function sendEphemeral(i, payload, ttlMs) {
 	const opts = { ...payload, flags: MessageFlags.Ephemeral, fetchReply: true };
 	let msg = null;
 	try {
-		if (i.deferred || i.replied) {
-			msg = await i.followUp(opts);
-		} else {
-			msg = await i.reply(opts);
-		}
+		// Prefer followUp so lifecycle is decoupled from the original message
+		msg = await i.followUp(opts);
 	} catch {
-		return null;
+		// If followUp fails (no initial response yet), reply once as fallback
+		try { msg = await i.reply(opts); } catch { return null; }
 	}
-	if (ttlMs) {
+	if (ttlMs && msg?.id) {
 		setTimeout(() => {
-			i.deleteReply?.().catch(() => {
-				i.webhook?.deleteMessage?.(msg.id).catch(() => {});
-			});
+			i.webhook?.deleteMessage?.(msg.id).catch(() => {});
 		}, ttlMs);
 	}
 	return msg;
 }
 
+// For nested interactions (like roleInteraction), also delete only by id via webhook.
 async function replyEphemeral(interaction, payload, ttlMs) {
 	let msg = null;
 	try {
 		msg = await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral, fetchReply: true });
 	} catch {
-		return null;
+		try { msg = await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral, fetchReply: true }); }
+		catch { return null; }
 	}
-	if (ttlMs) {
+	if (ttlMs && msg?.id) {
 		setTimeout(() => {
-			interaction.deleteReply?.().catch(() => {
-				interaction.webhook?.deleteMessage?.(msg.id).catch(() => {});
-			});
+			interaction.webhook?.deleteMessage?.(msg.id).catch(() => {});
 		}, ttlMs);
 	}
 	return msg;
@@ -198,6 +196,7 @@ async function writeCustomQueue(channel) {
 		if (!['join_queue', 'leave_queue'].includes(i.customId)) return;
 		const userId = i.user.id;
 
+		// Ack in <3s to avoid "Interaction failed"
 		if (!i.deferred && !i.replied) {
 			await i.deferUpdate().catch(() => {});
 		}
@@ -301,6 +300,7 @@ async function writeCustomQueue(channel) {
 		let createdCategory = false;
 
 		try {
+			// Reuse the lobby VC's parent category if present; otherwise create a new one
 			const lobbyVC = channel.guild.channels.cache.get(config.botVCchannel);
 			const parentCategory =
 				lobbyVC?.parent ?? (lobbyVC?.parentId ? channel.guild.channels.cache.get(lobbyVC.parentId) : null);
@@ -384,7 +384,7 @@ async function writeCustomQueue(channel) {
 				await safeDelete(matches.blue);
 				await safeDelete(matches.red);
 				if (createdCategory) await safeDelete(queueChannels.category);
-				
+
 				state.queues.set(queueNumber, makeEmptyQueue());
 				return;
 			}
