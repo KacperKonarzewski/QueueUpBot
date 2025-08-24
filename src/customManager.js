@@ -73,9 +73,6 @@ function deleteEphemeralBy(webhookOwnerInteraction, msg, delayMs = 0) {
 	setTimeout(() => { webhookOwnerInteraction.webhook.deleteMessage(msg.id).catch(() => {}); }, delayMs);
 }
 
-/* --------------------------------------------
- * Simple per-key async mutex to serialize button handlers
- * ------------------------------------------ */
 class Mutex {
 	constructor() { this._q = Promise.resolve(); }
 	run(fn) {
@@ -166,7 +163,7 @@ function buildAdminRow() {
 		new ButtonBuilder()
 			.setCustomId('admin_kick_panel')
 			.setLabel('Manage Queue')
-			.setStyle(ButtonStyle.Danger)
+			.setStyle(ButtonStyle.Primary)
 			.setEmoji('🧹')
 	);
 }
