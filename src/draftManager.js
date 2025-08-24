@@ -1,91 +1,145 @@
-const { generateWaitEmbed, startCaptainVote, sendDraftLinks } = require('./messages');
-const { createDraftLinks } = require('./draftlol');
+const { generateWaitEmbed, sendDraftLinks } = require('./messages');
+const { startCaptainVote } = require('./draft/voteCaptain');
+const { startCaptainDraft } = require('./draft/voteTeam');
+const { createDraftLinks } = require('./draft/draftLol');
 
-const fakeGuild = {
-	members: {
-		cache: new Map([
-			['user1', { id: 'user1', voice: { channelId: null }, user: { tag: 'User1' } }],
-			['user2', { id: 'user2', voice: { channelId: null }, user: { tag: 'User2' } }],
-			['user3', { id: 'user3', voice: { channelId: null }, user: { tag: 'User3' } }],
-			['user4', { id: 'user4', voice: { channelId: null }, user: { tag: 'User4' } }],
-			['user5', { id: 'user5', voice: { channelId: null }, user: { tag: 'User5' } }],
-			['user6', { id: 'user6', voice: { channelId: null }, user: { tag: 'User6' } }],
-			['user7', { id: 'user7', voice: { channelId: null }, user: { tag: 'User7' } }],
-			['user8', { id: 'user8', voice: { channelId: null }, user: { tag: 'User8' } }],
-			['user9', { id: 'user9', voice: { channelId: null }, user: { tag: 'User9' } }],
-			['279964394157244416', { id: '279964394157244416', voice: { channelId: null }, user: { tag: 'kacutoja' } }],
-		])
-	}
-};
+const waitForMembersInChannel = async (members, channels, queueNumber, timeoutMs = 300000) => {
+	return new Promise(async (resolve, reject) => {
+		const textChannel = channels['text' + queueNumber];
+		const voiceChannel = channels['voice' + queueNumber];
 
-const waitForMembersInChannel = async (members, channels, queueNumber, timeout = 60000) => {
-    return new Promise(async (resolve, reject) => {
-        const start = Date.now();
+		if (!textChannel || !voiceChannel) {
+			return reject(new Error('❌ Draft channels are missing.'));
+		}
 
-		const statusMessage = await channels['text' + queueNumber].send({
-			embeds: [generateWaitEmbed(members, channels['voice' + queueNumber], start, timeout)]
-		});
+		const guild = textChannel.guild;
 
-		const interval = setInterval(async () => {
-            const ready = members.filter(m => m.voice.channelId === channels['voice' + queueNumber].id);
-            const missing = members.filter(m => m.voice.channelId !== channels['voice' + queueNumber].id);
+		const uniqueIds = Array.from(new Set(members.map(m => m?.id || m))).filter(Boolean);
+		const resolvedMembers = (await Promise.all(
+			uniqueIds.map(async (id) => guild.members.cache.get(id) || guild.members.fetch(id).catch(() => null))
+		)).filter(Boolean);
 
-           await statusMessage.edit({
-				embeds: [generateWaitEmbed(members, channels['voice' + queueNumber], start, timeout)]
-			});
+		const endAt = Date.now() + timeoutMs;
 
-            if (ready.length === members.length) {
-                clearInterval(interval);
-                resolve();
-            } else if (Date.now() - start > timeout) {
-                clearInterval(interval);
-                reject(
-                    new Error(
-                        `❌ Not all members joined the voice channel in time: ${missing
-                            .map(m => m.user.tag)
-                            .join(', ')}`
-                    )
-                );
-            }
-        }, 1000);
-    });
+		let statusMessage = null;
+		try {
+			statusMessage = await textChannel.send({ embeds: [generateWaitEmbed(resolvedMembers, voiceChannel, endAt)] });
+		} catch (_) { }
+
+		let lastMissingKey = null;
+		let lastEditAt = 0;
+
+		const everyoneReady = () =>
+			resolvedMembers.every(m => m?.voice?.channelId === voiceChannel.id);
+
+		const getMissing = () =>
+			resolvedMembers.filter(m => m?.voice?.channelId !== voiceChannel.id);
+
+		const updateStatus = async () => {
+			if (!statusMessage?.editable) return;
+			const now = Date.now();
+
+			if (now - lastEditAt < 1500) return;
+			lastEditAt = now;
+			try {
+				await statusMessage.edit({
+					embeds: [generateWaitEmbed(resolvedMembers, voiceChannel, endAt)]
+				});
+			} catch (_) { }
+		};
+
+		const cleanup = () => {
+			clearTimeout(timeoutTimer);
+			clearInterval(pollInterval);
+			guild.client.removeListener('voiceStateUpdate', onVoiceStateUpdate);
+		};
+
+		const finishResolve = () => {
+			cleanup();
+			if (statusMessage?.deletable) {
+				setTimeout(() => statusMessage.delete().catch(() => { }), 2000);
+			}
+			resolve();
+		};
+
+		const finishReject = (err) => {
+			cleanup();
+			try { updateStatus(); } catch { }
+			reject(err);
+		};
+
+		const onVoiceStateUpdate = (oldState, newState) => {
+			const uid = newState?.id || oldState?.id;
+			if (!uniqueIds.includes(uid)) return;
+
+			if (!guild.channels.cache.has(voiceChannel.id) || !guild.channels.cache.has(textChannel.id)) {
+				return finishReject(new Error('❌ Draft channels were removed.'));
+			}
+
+			const missing = getMissing();
+			const missingKey = missing.map(m => m.id).sort().join(',');
+			if (missingKey !== lastMissingKey) {
+				lastMissingKey = missingKey;
+				if (everyoneReady()) return finishResolve();
+				updateStatus();
+			}
+		};
+
+		guild.client.on('voiceStateUpdate', onVoiceStateUpdate);
+
+		const pollInterval = setInterval(() => {
+			if (!guild.channels.cache.has(voiceChannel.id) || !guild.channels.cache.has(textChannel.id)) {
+				return finishReject(new Error('❌ Draft channels were removed.'));
+			}
+			if (everyoneReady()) return finishResolve();
+
+			const missing = getMissing();
+			const missingKey = missing.map(m => m.id).sort().join(',');
+			if (missingKey !== lastMissingKey) {
+				lastMissingKey = missingKey;
+				updateStatus();
+			}
+		}, 3000);
+
+		const timeoutTimer = setTimeout(() => {
+			const missing = getMissing();
+			const list = missing.map(m => m.user?.tag ?? m.id).join(', ');
+			finishReject(new Error(`❌ Not all members joined the voice channel in time: ${list || 'unknown'}`));
+		}, timeoutMs);
+
+		if (everyoneReady()) return finishResolve();
+	});
 };
 
 const draftStart = async (queue, config, channels, guild, queueNumber) => {
-	fakeGuild.members.cache.get('user1').voice.channelId = channels['voice' + queueNumber].id;
-	fakeGuild.members.cache.get('user2').voice.channelId = channels['voice' + queueNumber].id;
-	fakeGuild.members.cache.get('user3').voice.channelId = channels['voice' + queueNumber].id;
-	fakeGuild.members.cache.get('user4').voice.channelId = channels['voice' + queueNumber].id;
-	fakeGuild.members.cache.get('user5').voice.channelId = channels['voice' + queueNumber].id;
-	fakeGuild.members.cache.get('user6').voice.channelId = channels['voice' + queueNumber].id;
-	fakeGuild.members.cache.get('user7').voice.channelId = channels['voice' + queueNumber].id;
-	fakeGuild.members.cache.get('user8').voice.channelId = channels['voice' + queueNumber].id;
-	fakeGuild.members.cache.get('user9').voice.channelId = channels['voice' + queueNumber].id;
-	fakeGuild.members.cache.get('279964394157244416').voice.channelId = channels['voice' + queueNumber].id;
-
 	try {
-		//const members = Object.values(queue).flat().map(id => guild.members.cache.get(id)).filter(Boolean);
-		const members = Object.values(queue).flat().map(id => fakeGuild.members.cache.get(id)).filter(Boolean);				
-		await waitForMembersInChannel(members, channels, queueNumber);
-		const captains = await startCaptainVote(channels['text' + queueNumber], guild, queue);
-	}
-	catch (err) {
-		throw new Error(err.message);
-	}
-	
+		const ids = Object.values(queue).flat();
+		const uniq = Array.from(new Set(ids));
+		const members = (await Promise.all(
+			uniq.map(async id => guild.members.cache.get(id) || guild.members.fetch(id).catch(() => null))
+		)).filter(Boolean);
 
-	//--------------------------------------------
+		const waitMs = Number.isFinite(config?.WaitForMembersTimeoutMs) ? config.WaitForMembersTimeoutMs : 300000;
+		const voteMs = Number.isFinite(config?.CaptainsVoteTimeoutMs) ? config.CaptainsVoteTimeoutMs : 60000;
 
-	//(async () => {
-	//		try {
-	//			const links = await createDraftLinks();
-	//			await sendDraftLinks(channels['text' + queueNumber], links);
-	//		} catch (err) {
-	//			console.error(err);
-	//		}
-	//	})();
-	//await pickCapitans(queue, config);
-}
+		await waitForMembersInChannel(members, channels, queueNumber, waitMs);
+
+		const captains = await startCaptainVote(channels['text' + queueNumber], guild, queue, voteMs);
+
+		const teams = await startCaptainDraft(channels['text' + queueNumber], queue, captains);
+
+		try {
+			const links = await createDraftLinks();
+			await sendDraftLinks(channels['text' + queueNumber], links);
+		} catch (e) {
+			console.error('createDraftLinks/sendDraftLinks failed:', e?.message || e);
+		}
+
+		return teams;
+	} catch (err) {
+		throw new Error(err?.message || 'Draft failed');
+	}
+};
 
 module.exports = {
 	draftStart

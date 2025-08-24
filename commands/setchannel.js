@@ -21,8 +21,8 @@ module.exports = {
 		if (!channel || !(await isValidChannel(interaction.guild, channel.id))) {
 			return interaction.reply({ content: '❌ That channel does not exist or is not accessible to me.', flags: MessageFlags.Ephemeral });
 		}
-		if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-			return interaction.reply({ content: '❌ You must be an admin to use this command.', flags: MessageFlags.Ephemeral });
+		if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator) && !interaction.member.roles.cache.has("1386385941278621894")) {
+			return interaction.reply({ content: '❌ You must be an admin/mod to use this command.', flags: MessageFlags.Ephemeral });
 		}
 		if (channel.type !== ChannelType.GuildText) {
 			return interaction.reply({ content: '❌ You must select a text channel.', flags: MessageFlags.Ephemeral });

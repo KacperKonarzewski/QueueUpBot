@@ -16,16 +16,195 @@ const clearPreviousMessage = async (channel, config) => {
 
 //--------------------------------------------
 
-const generateWaitEmbed = (members, voiceChannel, start, timeout) => {
+const ROLE_ORDER = ['Top', 'Jungle', 'Mid', 'ADC', 'Support'];
+const ROLE_LABEL = { Top:'Top', Jungle:'Jungle', Mid:'Mid', ADC:'ADC', Support:'Support' };
+
+const teamIds = (teams, key) => ROLE_ORDER.map(r => teams[key]?.picks?.[r]).filter(Boolean);
+
+const fmtSign = (n) => (n > 0 ? `+${n}` : `${n}`);
+const arrow = (n) => (n > 0 ? '▲' : (n < 0 ? '▼' : '•'));
+
+const buildPointsUpdateEmbed = (guild, teams, points, winner) => {
+	const blueIds = teamIds(teams, 'blue');
+	const redIds = teamIds(teams, 'red');
+
+	const display = (id) => {
+		const m = guild.members.cache.get(id);
+		return m?.displayName || m?.user?.username || id;
+	};
+
+	const lineFor = (roleKey, id) => {
+		const d = points.deltas[id] ?? 0;
+		const after = points.after[id] ?? 500;
+		const before = after - d;
+		return `**${ROLE_LABEL[roleKey]}:** <@${id}>  \`${before} → ${after}\`  (**${fmtSign(d)}** ${arrow(d)})`;
+	};
+
+	const renderTeam = (key) => {
+		return ROLE_ORDER.map(role => {
+			const id = teams[key]?.picks?.[role];
+			return id ? lineFor(role, id) : `**${ROLE_LABEL[role]}:** —`;
+		}).join('\n');
+	};
+
+	const sum = (ids) => ids.reduce((a, id) => a + (points.deltas[id] ?? 0), 0);
+	const blueSum = sum(blueIds);
+	const redSum = sum(redIds);
+
+	const color = winner === 'blue' ? 0x3498db : 0xe74c3c;
+
+	return new EmbedBuilder()
+		.setTitle('🏅 Match Result — Points Update')
+		.setDescription(
+			`Winner: ${winner === 'blue' ? '🔵 **Blue**' : '🔴 **Red**'}\n` +
+			`_Below are POINTS (public rating) changes per player._`
+		)
+		.addFields(
+			{ name: `🔵 Blue — Total ${fmtSign(blueSum)}`, value: renderTeam('blue'), inline: false },
+			{ name: `🔴 Red — Total ${fmtSign(redSum)}`, value: renderTeam('red'), inline: false },
+		)
+		.setColor(color)
+		.setFooter({ text: 'Note: hidden MMR was also updated under the hood.' });
+}
+
+const teamMemberIds = (team) =>
+	ROLE_ORDER.map(r => team?.picks?.[r]).filter(Boolean);
+
+const renderRoster = (team) =>
+	ROLE_ORDER.map(r => `**${r}:** ${team?.picks?.[r] ? `<@${team.picks[r]}>` : '—'}`).join('\n');
+
+const collectWinnerVoteFromTeams = async (channel, opts) => {
+	const {
+		teams,
+		threshold = 6,
+		timeoutMs = 7_200_000,
+		prompt = 'Vote which team won the match:',
+		blueName = 'Blue',
+		redName = 'Red',
+	} = opts;
+
+	const blueIds = teamMemberIds(teams.blue);
+	const redIds = teamMemberIds(teams.red);
+
+	const eligible = new Set([...blueIds, ...redIds]);
+
+	const votes = new Map();
+	const counts = { blue: 0, red: 0 };
+
+	const voters = {
+		blue: () => [...votes.entries()].filter(([, v]) => v === 'blue').map(([uid]) => uid),
+		red: () => [...votes.entries()].filter(([, v]) => v === 'red').map(([uid]) => uid),
+	};
+
+	const buildEmbed = () => new EmbedBuilder()
+		.setTitle('🏁 Match Result Vote')
+		.setDescription([
+			prompt,
+			'',
+			`**${blueName}** votes: **${counts.blue} / ${threshold}**`,
+			`**${redName}** votes: **${counts.red} / ${threshold}**`,
+			'',
+			`**${blueName} roster**\n${renderRoster(teams.blue)}`,
+			'',
+			`**${redName} roster**\n${renderRoster(teams.red)}`,
+			'',
+			'_Only players from these teams can vote. You can change or clear your vote._'
+		].join('\n'))
+		.addFields(
+			{ name: `${blueName} voters`, value: voters.blue().map(id => `<@${id}>`).join(', ') || '—', inline: false },
+			{ name: `${redName} voters`, value: voters.red().map(id => `<@${id}>`).join(', ') || '—', inline: false },
+		)
+		.setColor(0x5865F2);
+
+	const row = new ActionRowBuilder().addComponents(
+		new ButtonBuilder().setCustomId('vote_blue').setLabel(`${blueName} Won`).setStyle(ButtonStyle.Primary),
+		new ButtonBuilder().setCustomId('vote_red').setLabel(`${redName} Won`).setStyle(ButtonStyle.Danger),
+		new ButtonBuilder().setCustomId('vote_clear').setLabel('Clear my vote').setStyle(ButtonStyle.Secondary),
+	);
+
+	const msg = await channel.send({ embeds: [buildEmbed()], components: [row] });
+
+	const endWith = async (winner, reason) => {
+		const disabledRow = new ActionRowBuilder().addComponents(
+			row.components.map(b => ButtonBuilder.from(b).setDisabled(true))
+		);
+		const final = new EmbedBuilder(buildEmbed().data)
+			.setFooter({ text: winner ? `Winner: ${winner === 'blue' ? blueName : redName}` : 'No side reached the threshold' })
+			.setColor(winner ? (winner === 'blue' ? 0x3498db : 0xe74c3c) : 0xf1c40f);
+
+		try { await msg.edit({ embeds: [final], components: [disabledRow] }); } catch { }
+		return {
+			winner: winner ?? null,
+			counts: { ...counts },
+			voters: { blue: voters.blue(), red: voters.red() },
+			reason
+		};
+	};
+
+	return await new Promise((resolve) => {
+		const collector = msg.createMessageComponentCollector({
+			componentType: ComponentType.Button,
+			time: timeoutMs
+		});
+
+		collector.on('collect', async (i) => {
+			const uid = i.user.id;
+
+			if (!eligible.has(uid)) {
+				return i.reply({ content: '❌ Only players from these teams can vote on the result.', ephemeral: true });
+			}
+
+			if (i.customId === 'vote_clear') {
+				const prev = votes.get(uid);
+				if (!prev) return i.reply({ content: 'You have no vote to clear.', ephemeral: true });
+				counts[prev]--;
+				votes.delete(uid);
+				await i.update({ embeds: [buildEmbed()], components: [row] });
+				return;
+			}
+
+			const choice = i.customId === 'vote_blue' ? 'blue' : i.customId === 'vote_red' ? 'red' : null;
+			if (!choice) return i.deferUpdate();
+
+			const prev = votes.get(uid);
+			if (prev === choice) {
+				return i.reply({ content: `You already voted for ${choice === 'blue' ? blueName : redName}.`, ephemeral: true });
+			}
+
+			if (prev) counts[prev]--;
+			votes.set(uid, choice);
+			counts[choice]++;
+
+			await i.update({ embeds: [buildEmbed()], components: [row] });
+
+			if (counts[choice] >= threshold) {
+				collector.stop(`win:${choice}`);
+			}
+		});
+
+		collector.on('end', async (_collected, reason) => {
+			if (reason?.startsWith('win:')) {
+				const winner = reason.split(':')[1] === 'blue' ? 'blue' : 'red';
+				const payload = await endWith(winner, 'threshold');
+				return resolve(payload);
+			}
+			endWith(null, 'timeout').then(resolve);
+		});
+	});
+}
+//--------------------------------------------
+
+const generateWaitEmbed = (members, voiceChannel, endAt) => {
 	const missing = members.filter(m => m.voice.channelId !== voiceChannel.id);
 	const ready = members.filter(m => m.voice.channelId === voiceChannel.id);
 
 	const embed = new EmbedBuilder()
-		.setTitle(`⏰ Waiting for players to join`)
+		.setTitle('⏰ Waiting for players to join')
 		.setDescription(`Voice Channel: **${voiceChannel.name}**`)
 		.setColor(missing.length > 0 ? 0xffa500 : 0x1f8b4c);
 
 	if (missing.length > 0) {
+		const endTs = Math.floor(endAt / 1000);
 		embed.addFields(
 			{
 				name: `✅ Joined (${ready.length}/${members.length})`,
@@ -39,7 +218,7 @@ const generateWaitEmbed = (members, voiceChannel, start, timeout) => {
 			},
 			{
 				name: '⏳ Time left',
-				value: `${Math.max(0, Math.ceil((timeout - (Date.now() - start)) / 1000))} seconds`,
+				value: `<t:${endTs}:R>`,
 				inline: false,
 			}
 		);
@@ -49,213 +228,6 @@ const generateWaitEmbed = (members, voiceChannel, start, timeout) => {
 
 	return embed;
 };
-
-//--------------------------------------------
-
-const getQueueMemberIds = (queue) => {
-	return [...queue.Top, ...queue.Jg, ...queue.Mid, ...queue.Adc, ...queue.Supp];
-};
-
-const buildVoteButtons = (candidates, selectedIds = []) => {
-	const roleOrder = ['Top', 'Jungle', 'Mid', 'ADC', 'Support'];
-
-	const buckets = Object.fromEntries(roleOrder.map(r => [r, []]));
-	for (const c of candidates) {
-		const role = c.lane;
-		if (buckets[role]) {
-			if (buckets[role].length < 2) buckets[role].push(c);
-		}
-	}
-
-	const makeRow = (teamIdx) => {
-		const row = new ActionRowBuilder();
-		for (const role of roleOrder) {
-			const c = buckets[role][teamIdx];
-			if (c) {
-				const chosen = selectedIds.includes(c.id);
-				row.addComponents(
-					new ButtonBuilder()
-						.setCustomId(`vote:${c.id}`)
-						.setLabel(c.label)
-						.setStyle(chosen ? ButtonStyle.Primary : ButtonStyle.Secondary)
-				);
-			} else {
-				row.addComponents(
-					new ButtonBuilder()
-						.setCustomId(`noop:${role}:${teamIdx}`)
-						.setLabel(role)
-						.setStyle(ButtonStyle.Secondary)
-						.setDisabled(true)
-				);
-			}
-		}
-		return row;
-	};
-
-	return [makeRow(0), makeRow(1)];
-};
-
-const tallyVotes = (candidates, votes) => {
-	const counts = new Map(candidates.map(c => [c.id, 0]));
-	for (const arr of Object.values(votes)) {
-		if (!Array.isArray(arr)) continue;
-		for (const cid of arr) {
-			if (counts.has(cid)) counts.set(cid, counts.get(cid) + 1);
-		}
-	}
-	return counts;
-};
-
-const buildVoteEmbed = (candidates, votes, endAt) => {
-	const counts = tallyVotes(candidates, votes);
-	const totalVotes =  [...counts.values()].reduce((a, b) => a + b, 0);
-	const lines = candidates.map((c, idx) => {
-		const count = counts.get(c.id) ?? 0;
-		const bar = '█'.repeat(Math.min(count, 10)).padEnd(10, '░');
-		return `**${idx + 1}. ${c.lane} ** <@${c.id}> — **${count}** votes | \`${bar}\``;
-	});
-	const endTs = Math.floor(endAt / 1000);
-
-	return new EmbedBuilder()
-		.setTitle('🗳️ Vote for Captains')
-		.setDescription(
-			[
-				'Click a button below to cast/change your vote.',
-				'Only the 10 queued players can vote.',
-				'',
-				lines.join('\n\n')
-			].join('\n')
-		)
-		.addFields(
-			{ name: '🧮 Total votes', value: `${totalVotes}`, inline: true },
-			{ name: '⏳ Time left', value: `<t:${endTs}:R>`, inline: true },
-		)
-		.setColor(0x1f8b4c);
-}
-
-const openPanelButton = () =>{
-	return new ActionRowBuilder().addComponents(
-		new ButtonBuilder()
-			.setCustomId('open_panel')
-			.setLabel('Open Voting Panel')
-			.setStyle(ButtonStyle.Primary)
-			.setEmoji('🗳️')
-	);
-}
-
-//--------------------------------------------
-
-const startCaptainVote = async (textChannel, guild, queue, durationMs = 60000) => {
-	const ids = getQueueMemberIds(queue);
-	if (ids.length !== 10) {
-		throw new Error(`Expected 10 queued players, got ${ids.length}`);
-	}
-
-	const candidates = ids.map(id => {
-		const lane = queue.Top.includes(id) ? 'Top' :
-			queue.Jg.includes(id) ? 'Jungle' :
-			queue.Mid.includes(id) ? 'Mid' :
-			queue.Adc.includes(id) ? 'ADC' :
-			queue.Supp.includes(id) ? 'Support' : 'Unknown';
-		const m = guild.members.cache.get(id);
-		const label = m?.displayName || m?.user?.username || id.slice(0, 10);
-		return { id, lane, label: label.length > 28 ? label.slice(0, 28) : label };
-	});
-
-	const votes = {};
-
-	const endAt = Date.now() + durationMs;
-	let message = await textChannel.send({
-		embeds: [buildVoteEmbed(candidates, votes, endAt)],
-		components: [openPanelButton()]
-	});
-
-	const collector = message.createMessageComponentCollector({
-		componentType: ComponentType.Button,
-		time: durationMs
-	});
-
-	collector.on('collect', async (i) => {
-		if (!ids.includes(i.user.id)) {
-			await i.reply({ content: '❌ Only queued players can vote.', ephemeral: true });
-			return;
-		}
-
-		const voterId = i.user.id;
-		if (!votes[voterId]) votes[voterId] = [];
-		await i.update({
-			embeds: [buildVoteEmbed(candidates, votes, endAt)]
-		});
-
-		const picks = votes[voterId];
-		const panel = await i.followUp({
-			content: `Your current votes: ${picks.map(id => `<@${id}>`).join(', ') || 'none'}`,
-			components: buildVoteButtons(candidates, picks),
-			ephemeral: true,
-			fetchReply: true
-		});
-
-		const userCollector = panel.createMessageComponentCollector({
-			componentType: ComponentType.Button,
-			time: Math.max(0, endAt - Date.now()),
-			filter: ii => ii.user.id === voterId
-		});
-
-		userCollector.on('collect', async (ii) => {
-			const [, candidateId] = ii.customId.split(':');
-
-			const picks = votes[voterId];
-			const idx = picks.indexOf(candidateId);
-			if (idx >= 0) picks.splice(idx, 1);
-			else {
-				if (picks.length >= 2) {
-					await ii.reply({ content: '⚠️ You already selected 2 captains. Unselect one first.', ephemeral: true });
-					return;
-				}
-				picks.push(candidateId);
-			}
-			await ii.update({
-				content: `Your current votes: ${picks.map(id => `<@${id}>`).join(', ') || 'none'}`,
-				components: buildVoteButtons(candidates, picks)
-			});
-
-			await message.edit({
-				embeds: [buildVoteEmbed(candidates, votes, endAt)]
-			});
-		});
-	});
-
-
-	return await new Promise((resolve) => {
-		collector.on('end', async () => {
-			const tally = new Map(candidates.map(c => [c.id, 0]));
-			for (const arr of Object.values(votes)) {
-				for (const cid of arr) {
-					if (tally.has(cid)) tally.set(cid, tally.get(cid) + 1);
-				}
-			}
-
-			const sorted = [...tally.entries()].sort((a, b) => {
-				if (b[1] !== a[1]) return b[1] - a[1];
-				return a[0].localeCompare(b[0]);
-			});
-
-			const top2 = sorted.slice(0, 2).map(([cid]) => cid);
-
-			const finalEmbed = new EmbedBuilder()
-				.setTitle('🏆 Captains Selected')
-				.setDescription(
-					`**Captain 1:** <@${top2[0]}>\n**Captain 2:** <@${top2[1]}>\n\n` +
-					`Thanks for voting!`
-				)
-				.setColor(0x00b894);
-
-			await message.edit({ embeds: [finalEmbed], components: [] });
-
-			resolve(top2);
-		});
-	});
-}
 
 //--------------------------------------------
 
@@ -383,5 +355,6 @@ module.exports = {
 	generateVoting,
 	sendDraftLinks,
 	generateWaitEmbed,
-	startCaptainVote
+	collectWinnerVoteFromTeams,
+	buildPointsUpdateEmbed
 };

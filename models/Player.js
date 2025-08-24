@@ -1,4 +1,4 @@
-const mongoose = require('mongoose');
+const { mongoose } = require('../db');
 
 const playerSchema = new mongoose.Schema({
 	serverID: {
@@ -17,6 +17,10 @@ const playerSchema = new mongoose.Schema({
 		type: Number,
 		default: 500,
 	},
+	hiddenMMR: {
+		type: Number,
+		default: 500
+	},
 	matchWins: {
 		type: Number,
 		default: 0,
@@ -29,4 +33,4 @@ const playerSchema = new mongoose.Schema({
 
 playerSchema.index({ serverID: 1, discordID: 1 }, { unique: true });
 
-module.exports = mongoose.model('Player', playerSchema);
+module.exports = mongoose.models.Player || mongoose.model('Player', playerSchema);

@@ -1,4 +1,4 @@
-const mongoose = require('mongoose');
+const { mongoose } = require('../db');
 
 const configSchema = new mongoose.Schema({
 	serverID: {
@@ -17,6 +17,16 @@ const configSchema = new mongoose.Schema({
 		type: Number,
 		default: 1
 	},
-});
+	WaitForMembersTimeoutMs: {
+		type: Number,
+		default: 300000,
+		min: 10000
+	},
+	CaptainsVoteTimeoutMs: {
+		type: Number,
+		default: 60000,
+		min: 10000
+	}
+}, { timestamps: true });
 
-module.exports = mongoose.model('Config', configSchema);
+module.exports = mongoose.models.Config || mongoose.model('Config', configSchema);

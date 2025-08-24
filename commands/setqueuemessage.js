@@ -17,7 +17,7 @@ module.exports = {
 		const newHeader = interaction.options.getString('header');
 		//--------------------------------------------
 
-		if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+		if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator) && !interaction.member.roles.cache.has("1386385941278621894")) {
 			return interaction.reply({ content: '❌ You must be an admin to use this command.', flags: MessageFlags.Ephemeral });
 		}
 

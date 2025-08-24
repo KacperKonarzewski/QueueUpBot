@@ -1,0 +1,49 @@
+Date : 2025-08-17 05:05:40
+Directory : d:\QueueUpBot\QueueUpBot
+Total : 18 files,  1920 codes, 53 comments, 246 blanks, all 2219 lines
+
+Languages
++------------+------------+------------+------------+------------+------------+
+| language   | files      | code       | comment    | blank      | total      |
++------------+------------+------------+------------+------------+------------+
+| JavaScript |         16 |      1,405 |         53 |        244 |      1,702 |
+| JSON       |          2 |        515 |          0 |          2 |        517 |
++------------+------------+------------+------------+------------+------------+
+
+Directories
++------------------------------------------------------+------------+------------+------------+------------+------------+
+| path                                                 | files      | code       | comment    | blank      | total      |
++------------------------------------------------------+------------+------------+------------+------------+------------+
+| .                                                    |         18 |      1,920 |         53 |        246 |      2,219 |
+| . (Files)                                            |          4 |        637 |          4 |         28 |        669 |
+| commands                                             |          4 |        130 |         12 |         29 |        171 |
+| models                                               |          2 |         49 |          0 |          6 |         55 |
+| src                                                  |          8 |      1,104 |         37 |        183 |      1,324 |
+| src (Files)                                          |          5 |        638 |         31 |        108 |        777 |
+| src\draft                                            |          3 |        466 |          6 |         75 |        547 |
++------------------------------------------------------+------------+------------+------------+------------+------------+
+
+Files
++------------------------------------------------------+------------+------------+------------+------------+------------+
+| filename                                             | language   | code       | comment    | blank      | total      |
++------------------------------------------------------+------------+------------+------------+------------+------------+
+| d:\QueueUpBot\QueueUpBot\commands\setchannel.js      | JavaScript |         33 |          3 |          8 |         44 |
+| d:\QueueUpBot\QueueUpBot\commands\setqueuemessage.js | JavaScript |         36 |          4 |          5 |         45 |
+| d:\QueueUpBot\QueueUpBot\commands\setvc.js           | JavaScript |         34 |          3 |          8 |         45 |
+| d:\QueueUpBot\QueueUpBot\commands\start.js           | JavaScript |         27 |          2 |          8 |         37 |
+| d:\QueueUpBot\QueueUpBot\deploy-commands.js          | JavaScript |         29 |          0 |          7 |         36 |
+| d:\QueueUpBot\QueueUpBot\index.js                    | JavaScript |         93 |          4 |         19 |        116 |
+| d:\QueueUpBot\QueueUpBot\models\Config.js            | JavaScript |         20 |          0 |          2 |         22 |
+| d:\QueueUpBot\QueueUpBot\models\Player.js            | JavaScript |         29 |          0 |          4 |         33 |
+| d:\QueueUpBot\QueueUpBot\package-lock.json           | JSON       |        506 |          0 |          1 |        507 |
+| d:\QueueUpBot\QueueUpBot\package.json                | JSON       |          9 |          0 |          1 |         10 |
+| d:\QueueUpBot\QueueUpBot\src\customManager.js        | JavaScript |        181 |         21 |         32 |        234 |
+| d:\QueueUpBot\QueueUpBot\src\discordUtils.js         | JavaScript |        104 |          0 |         11 |        115 |
+| d:\QueueUpBot\QueueUpBot\src\draftManager.js         | JavaScript |         84 |          1 |         11 |         96 |
+| d:\QueueUpBot\QueueUpBot\src\draft\draftLol.js       | JavaScript |         48 |          0 |          6 |         54 |
+| d:\QueueUpBot\QueueUpBot\src\draft\voteCaptain.js    | JavaScript |        189 |          1 |         27 |        217 |
+| d:\QueueUpBot\QueueUpBot\src\draft\voteTeam.js       | JavaScript |        229 |          5 |         42 |        276 |
+| d:\QueueUpBot\QueueUpBot\src\messages.js             | JavaScript |        252 |          9 |         50 |        311 |
+| d:\QueueUpBot\QueueUpBot\src\playerManager.js        | JavaScript |         17 |          0 |          4 |         21 |
+| Total                                                |            |      1,920 |         53 |        246 |      2,219 |
++------------------------------------------------------+------------+------------+------------+------------+------------+
