@@ -79,6 +79,31 @@ function deleteEphemeralBy(webhookOwnerInteraction, msg, delayMs = 0) {
 	}, delayMs);
 }
 
+async function bumpQueueMessage(channel, config, queue, queueNumber) {
+	try {
+		// Delete old message if still exists
+		if (config.lastQueueMessageID) {
+			const oldMsg = await channel.messages.fetch(config.lastQueueMessageID).catch(() => null);
+			if (oldMsg) await oldMsg.delete().catch(() => {});
+		}
+
+		// Send new queue message at bottom
+		const queueMessage = await channel.send({
+			embeds: [generateQueue(queue, config)],
+			components: [createButtons()],
+		});
+
+		// Save new ID
+		config.lastQueueMessageID = queueMessage.id;
+		await config.save();
+
+		return queueMessage;
+	} catch (err) {
+		console.error("Failed to bump queue message:", err);
+	}
+}
+
+
 /* --------------------------------------------
  * Simple per-key async mutex to serialize button handlers
  * ------------------------------------------ */
@@ -174,10 +199,7 @@ async function writeCustomQueue(channel) {
 
 	await clearPreviousMessage(channel, config);
 
-	const queueMessage = await channel.send({
-		embeds: [generateQueue(queue, config)],
-		components: [createButtons()],
-	});
+	const queueMessage = await bumpQueueMessage(channel, config, queue, queueNumber);
 
 	await Config.findOneAndUpdate(
 		{ serverID },
@@ -394,4 +416,4 @@ async function writeCustomQueue(channel) {
 	});
 }
 
-module.exports = { writeCustomQueue };
+module.exports = { writeCustomQueue, bumpQueueMessage };
