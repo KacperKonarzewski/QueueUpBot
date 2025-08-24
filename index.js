@@ -4,7 +4,7 @@ const path = require('path');
 const { Client, Collection, GatewayIntentBits, ChannelType, PermissionFlagsBits, MessageFlags } = require('discord.js');
 const { connectToDb } = require('./db');
 const { addPlayerIfNotExists } = require('./src/playerManager');
-const { writeCustomQueue, bumpQueueMessage } = require('./src/customManager');
+const { writeCustomQueue, bumpQueueUI } = require('./src/customManager');
 const { deployCommandsForGuild } = require('./deploy-commands');
 const Config = require('./models/Config');
 
@@ -53,20 +53,14 @@ client.on('guildCreate', async (guild) => {
 });
 
 client.on('messageCreate', async (msg) => {
-	if (msg.author.bot) return;
+	if (!msg.guild || msg.author.bot) return;
 
 	const config = await Config.findOne({ serverID: msg.guild.id }).catch(() => null);
-	if (!config || !config.botChannel) return;
-
+	if (!config?.botChannel) return;
 	if (msg.channel.id !== config.botChannel) return;
 
-	const state = getGuildState(msg.guild.id);
-	const queueNumber = config.QueueNumber ?? 1;
-	const queue = state.queues.get(queueNumber);
-
-	await bumpQueueMessage(msg.channel, config, queue, queueNumber);
+	await bumpQueueUI(msg.channel).catch(() => {});
 });
-
 
 client.once('ready', async () => {
 	console.log(`Logged in as ${client.user.tag}`);

@@ -35,27 +35,20 @@ const maybeNumber = (n, fallback) => (typeof n === 'number' && Number.isFinite(n
  * Ephemeral helpers (auto-delete via webhook)
  * ------------------------------------------ */
 
-// Always create an EPHEMERAL FOLLOW-UP when possible and delete by id via webhook.
-// Never use deleteReply() here (can nuke the source message when deferred).
+// Always create EPHEMERAL FOLLOW-UP when possible; delete by id via webhook only.
 async function sendEphemeral(i, payload, ttlMs) {
 	const opts = { ...payload, flags: MessageFlags.Ephemeral, fetchReply: true };
 	let msg = null;
 	try {
-		// Prefer followUp so lifecycle is decoupled from the original message
 		msg = await i.followUp(opts);
 	} catch {
-		// If followUp fails (no initial response yet), reply once as fallback
 		try { msg = await i.reply(opts); } catch { return null; }
 	}
 	if (ttlMs && msg?.id) {
-		setTimeout(() => {
-			i.webhook?.deleteMessage?.(msg.id).catch(() => {});
-		}, ttlMs);
+		setTimeout(() => { i.webhook?.deleteMessage?.(msg.id).catch(() => {}); }, ttlMs);
 	}
 	return msg;
 }
-
-// For nested interactions (like roleInteraction), also delete only by id via webhook.
 async function replyEphemeral(interaction, payload, ttlMs) {
 	let msg = null;
 	try {
@@ -65,44 +58,14 @@ async function replyEphemeral(interaction, payload, ttlMs) {
 		catch { return null; }
 	}
 	if (ttlMs && msg?.id) {
-		setTimeout(() => {
-			interaction.webhook?.deleteMessage?.(msg.id).catch(() => {});
-		}, ttlMs);
+		setTimeout(() => { interaction.webhook?.deleteMessage?.(msg.id).catch(() => {}); }, ttlMs);
 	}
 	return msg;
 }
-
 function deleteEphemeralBy(webhookOwnerInteraction, msg, delayMs = 0) {
 	if (!msg?.id || !webhookOwnerInteraction?.webhook) return;
-	setTimeout(() => {
-		webhookOwnerInteraction.webhook.deleteMessage(msg.id).catch(() => {});
-	}, delayMs);
+	setTimeout(() => { webhookOwnerInteraction.webhook.deleteMessage(msg.id).catch(() => {}); }, delayMs);
 }
-
-async function bumpQueueMessage(channel, config, queue, queueNumber) {
-	try {
-		// Delete old message if still exists
-		if (config.lastQueueMessageID) {
-			const oldMsg = await channel.messages.fetch(config.lastQueueMessageID).catch(() => null);
-			if (oldMsg) await oldMsg.delete().catch(() => {});
-		}
-
-		// Send new queue message at bottom
-		const queueMessage = await channel.send({
-			embeds: [generateQueue(queue, config)],
-			components: [createButtons()],
-		});
-
-		// Save new ID
-		config.lastQueueMessageID = queueMessage.id;
-		await config.save();
-
-		return queueMessage;
-	} catch (err) {
-		console.error("Failed to bump queue message:", err);
-	}
-}
-
 
 /* --------------------------------------------
  * Simple per-key async mutex to serialize button handlers
@@ -125,12 +88,21 @@ const getLock = (key) => {
  * In-memory per-guild/per-queue state
  * ------------------------------------------ */
 const globalState = new Map();
+/*
+state = {
+	queues: Map<queueNumber, Queue>,
+	channels: Map<queueNumber, Channels>,
+	matches: Map<queueNumber, Matches>,
+	queueMessages: Map<queueNumber, Message>
+}
+*/
 function getGuildState(serverID) {
 	if (!globalState.has(serverID)) {
 		globalState.set(serverID, {
 			queues: new Map(),
 			channels: new Map(),
 			matches: new Map(),
+			queueMessages: new Map(),
 		});
 	}
 	return globalState.get(serverID);
@@ -171,54 +143,32 @@ function removeUserFromQueue(queue, userId) {
 	return false;
 }
 
-async function writeCustomQueue(channel) {
-	const serverID = channel.guild.id;
-	const config = await Config.findOne({ serverID }) ?? new Config({ serverID });
+/* --------------------------------------------
+ * UI creation / bumping (NO RESET)
+ * ------------------------------------------ */
 
-	const perRoleCap = maybeNumber(config.PerRoleCapacity, 2);
-	const voteThreshold = maybeNumber(config.VoteThreshold, 6);
-	const voteTimeoutMs = maybeNumber(config.VoteTimeoutMs, 2 * 60 * 60 * 1000);
-	const deleteShortMs = maybeNumber(config.DeleteShortMs, 2000);
-	const deleteMediumMs = maybeNumber(config.DeleteMediumMs, 5000);
-	const deleteLongMs = maybeNumber(config.DeleteLongMs, 10000);
+async function createQueueMessage(channel, config, queue) {
+	const msg = await channel.send({
+		embeds: [generateQueue(queue, config)],
+		components: [createButtons()],
+	});
+	// Persist last message id
+	config.lastQueueMessageID = msg.id;
+	await config.save().catch(() => {});
+	return msg;
+}
 
-	if (typeof config.QueueNumber !== 'number' || !Number.isFinite(config.QueueNumber)) {
-		config.QueueNumber = 1;
-	}
-	const queueNumber = config.QueueNumber;
-
-	const state = getGuildState(serverID);
-
-	state.queues.set(queueNumber, makeEmptyQueue());
-	state.channels.set(queueNumber, {});
-	state.matches.set(queueNumber, {});
-
-	const queue = state.queues.get(queueNumber);
-	const queueChannels = state.channels.get(queueNumber);
-	const matches = state.matches.get(queueNumber);
-
-	await clearPreviousMessage(channel, config);
-
-	const queueMessage = await bumpQueueMessage(channel, config, queue, queueNumber);
-
-	await Config.findOneAndUpdate(
-		{ serverID },
-		{ lastQueueMessageID: queueMessage.id },
-		{ upsert: true }
-	);
-
+function attachQueueCollector(queueMessage, { serverID, queueNumber, queue, config, onQueueFull }) {
 	const collector = queueMessage.createMessageComponentCollector({
 		componentType: ComponentType.Button,
 		time: 0,
 	});
-
 	const lock = getLock(`${serverID}:${queueNumber}`);
 
 	collector.on('collect', async (i) => {
 		if (!['join_queue', 'leave_queue'].includes(i.customId)) return;
 		const userId = i.user.id;
 
-		// Ack in <3s to avoid "Interaction failed"
 		if (!i.deferred && !i.replied) {
 			await i.deferUpdate().catch(() => {});
 		}
@@ -228,20 +178,17 @@ async function writeCustomQueue(channel) {
 
 			if (i.customId === 'join_queue') {
 				if (Object.values(queue).flat().includes(userId)) {
-					await sendEphemeral(i, { content: '❌ You are already in the queue!' }, deleteShortMs);
+					await sendEphemeral(i, { content: '❌ You are already in the queue!' }, maybeNumber(config.DeleteShortMs, 2000));
 					return;
 				}
-				if (isQueueFull(queue, perRoleCap)) {
-					await sendEphemeral(i, { content: '❌ The queue is already full!' }, deleteShortMs);
+				if (isQueueFull(queue, maybeNumber(config.PerRoleCapacity, 2))) {
+					await sendEphemeral(i, { content: '❌ The queue is already full!' }, maybeNumber(config.DeleteShortMs, 2000));
 					return;
 				}
 
 				const rolePromptMsg = await sendEphemeral(
 					i,
-					{
-						content: 'Choose your role:',
-						components: [createRoleButtons(queue, perRoleCap)],
-					},
+					{ content: 'Choose your role:', components: [createRoleButtons(queue, maybeNumber(config.PerRoleCapacity, 2))] },
 					null
 				);
 
@@ -256,36 +203,36 @@ async function writeCustomQueue(channel) {
 				deleteEphemeralBy(i, rolePromptMsg, 0);
 
 				if (!roleInteraction) {
-					await sendEphemeral(i, { content: '⏰ You did not pick a role in time.' }, deleteShortMs);
+					await sendEphemeral(i, { content: '⏰ You did not pick a role in time.' }, maybeNumber(config.DeleteShortMs, 2000));
 					return;
 				}
 
 				const role = roleInteraction.customId.replace('role_', '');
 
 				if (Object.values(queue).flat().includes(userId)) {
-					await replyEphemeral(roleInteraction, { content: '❌ You are already in the queue!' }, deleteShortMs);
+					await replyEphemeral(roleInteraction, { content: '❌ You are already in the queue!' }, maybeNumber(config.DeleteShortMs, 2000));
 					needsEdit = false;
 					return;
 				}
 				if (!queue[role]) {
-					await replyEphemeral(roleInteraction, { content: `❌ Unknown role: ${role}` }, deleteShortMs);
+					await replyEphemeral(roleInteraction, { content: `❌ Unknown role: ${role}` }, maybeNumber(config.DeleteShortMs, 2000));
 					needsEdit = false;
 					return;
 				}
-				if (queue[role].length >= perRoleCap) {
-					await replyEphemeral(roleInteraction, { content: `❌ The ${role} role is full!` }, deleteShortMs);
+				if (queue[role].length >= maybeNumber(config.PerRoleCapacity, 2)) {
+					await replyEphemeral(roleInteraction, { content: `❌ The ${role} role is full!` }, maybeNumber(config.DeleteShortMs, 2000));
 					needsEdit = false;
 					return;
 				}
 
 				queue[role].push(userId);
-				await replyEphemeral(roleInteraction, { content: `✅ You joined as ${role}!` }, deleteShortMs);
+				await replyEphemeral(roleInteraction, { content: `✅ You joined as ${role}!` }, maybeNumber(config.DeleteShortMs, 2000));
 			} else if (i.customId === 'leave_queue') {
 				const removed = removeUserFromQueue(queue, userId);
 				if (removed) {
-					await sendEphemeral(i, { content: '✅ You left the queue!' }, deleteShortMs);
+					await sendEphemeral(i, { content: '✅ You left the queue!' }, maybeNumber(config.DeleteShortMs, 2000));
 				} else {
-					await sendEphemeral(i, { content: '❌ You are not in the queue!' }, deleteShortMs);
+					await sendEphemeral(i, { content: '❌ You are not in the queue!' }, maybeNumber(config.DeleteShortMs, 2000));
 				}
 			}
 
@@ -296,124 +243,223 @@ async function writeCustomQueue(channel) {
 				}).catch(() => {});
 			}
 
-			if (isQueueFull(queue, perRoleCap)) {
+			if (isQueueFull(queue, maybeNumber(config.PerRoleCapacity, 2))) {
 				collector.stop('Queue is full');
 			}
 		});
 	});
 
-	collector.on('end', async (_collected, reason) => {
-		const cleanupAll = async (createdCategory) => {
-			await wait(deleteLongMs);
-			await safeDelete(queueChannels.text);
-			if (createdCategory) await safeDelete(queueChannels.category);
-			globalState.get(serverID)?.queues?.delete(queueNumber);
-			globalState.get(serverID)?.channels?.delete(queueNumber);
-			globalState.get(serverID)?.matches?.delete(queueNumber);
-		};
-
-		if (reason !== 'Queue is full') {
-			return cleanupAll(false);
-		}
-
-		const mess = await channel.send({ content: 'The queue is now full! Starting the game...' }).catch(() => null);
-		setTimeout(async () => { try { if (mess) await mess.delete(); } catch {} }, deleteMediumMs);
-
-		let createdCategory = false;
-
-		try {
-			// Reuse the lobby VC's parent category if present; otherwise create a new one
-			const lobbyVC = channel.guild.channels.cache.get(config.botVCchannel);
-			const parentCategory =
-				lobbyVC?.parent ?? (lobbyVC?.parentId ? channel.guild.channels.cache.get(lobbyVC.parentId) : null);
-
-			if (parentCategory && parentCategory.type === ChannelType.GuildCategory) {
-				queueChannels.category = parentCategory;
-			} else {
-				queueChannels.category = await createCategory(channel.guild, `Queue #${queueNumber}`);
-				createdCategory = true;
-				await moveCategoryToBottom?.(channel.guild, queueChannels.category).catch(() => {});
-			}
-
-			queueChannels.text = await createTextChannel(channel.guild, queueChannels.category, `Queue #${queueNumber}`);
-			queueChannels.voice = await createVoiceChannel(channel.guild, queueChannels.category, `Queue VC #${queueNumber}`);
-
-			await moveUsersToVoiceChannel(channel.guild, queueChannels.voice, config.botVCchannel, queue);
-
-			let teams;
-			try {
-				teams = await draftStart(queue, config, queueChannels, channel.guild, queueNumber);
-
-				matches.blue = await createVoiceChannel(channel.guild, queueChannels.category, `Blue VC #${queueNumber}`);
-				matches.red = await createVoiceChannel(channel.guild, queueChannels.category, `Red VC #${queueNumber}`);
-
-				await moveUsersToVoiceChannel(channel.guild, matches.blue, queueChannels.voice.id, teams.blue.picks);
-				await moveUsersToVoiceChannel(channel.guild, matches.red, queueChannels.voice.id, teams.red.picks);
-
-				await safeDelete(queueChannels.voice);
-
-				state.queues.set(queueNumber, makeEmptyQueue());
-				config.QueueNumber += 1;
-				await config.save();
-
-				const vote = await collectWinnerVoteFromTeams(queueChannels.text, {
-					teams,
-					threshold: voteThreshold,
-					timeoutMs: voteTimeoutMs,
-					blueName: 'Blue',
-					redName: 'Red',
-					prompt: 'Teams, please vote who won the match:',
-				});
-
-				const { points, mmr } = await applyMatchResult({
-					serverID,
-					teams,
-					winner: vote.winner,
-				});
-
-				await queueChannels.text.send({
-					embeds: [buildPointsUpdateEmbed(channel.guild, teams, points, vote.winner)],
-				});
-
-				const botVC = channel.guild.channels.cache.get(config.botVCchannel);
-				await moveUsersToVoiceChannel(channel.guild, botVC, matches.blue.id, teams.blue.picks);
-				await moveUsersToVoiceChannel(channel.guild, botVC, matches.red.id, teams.red.picks);
-
-				await safeDelete(matches.blue);
-				await safeDelete(matches.red);
-			} catch (err) {
-				await queueChannels.text?.send?.({ content: err?.message ?? 'Unexpected error during draft or match setup.' }).catch(() => {});
-				await wait(deleteMediumMs);
-
-				const botVC = channel.guild.channels.cache.get(config.botVCchannel);
-				if (queueChannels.voice) {
-					await moveUsersToVoiceChannel(channel.guild, botVC, queueChannels.voice.id, state.queues.get(queueNumber) ?? queue);
-				} else if (matches.blue || matches.red) {
-					try {
-						if (matches.blue && err?.teams?.blue?.picks) {
-							await moveUsersToVoiceChannel(channel.guild, botVC, matches.blue.id, err.teams.blue.picks);
-						}
-					} catch {}
-					try {
-						if (matches.red && err?.teams?.red?.picks) {
-							await moveUsersToVoiceChannel(channel.guild, botVC, matches.red.id, err.teams.red.picks);
-						}
-					} catch {}
-				}
-
-				await safeDelete(queueChannels.text);
-				await safeDelete(queueChannels.voice);
-				await safeDelete(matches.blue);
-				await safeDelete(matches.red);
-				if (createdCategory) await safeDelete(queueChannels.category);
-
-				state.queues.set(queueNumber, makeEmptyQueue());
-				return;
-			}
-		} finally {
-			await cleanupAll(createdCategory);
+	collector.on('end', (_collected, reason) => {
+		if (reason === 'Queue is full') {
+			onQueueFull?.();
 		}
 	});
 }
 
-module.exports = { writeCustomQueue, bumpQueueMessage };
+async function replaceQueueUIAtBottom(channel, config, queue, serverID, queueNumber) {
+	const state = getGuildState(serverID);
+
+	// Create new message at bottom
+	const newMsg = await createQueueMessage(channel, config, queue);
+
+	// Attach fresh collector bound to existing queue object
+	attachQueueCollector(newMsg, {
+		serverID,
+		queueNumber,
+		queue,
+		config,
+		onQueueFull: () => onQueueFullFlow({ channel, config, serverID, queueNumber })
+	});
+
+	// Delete old message (if any)
+	const oldId = state.queueMessages.get(queueNumber)?.id || config.lastQueueMessageID;
+	if (oldId && oldId !== newMsg.id) {
+		const oldMsg = await channel.messages.fetch(oldId).catch(() => null);
+		if (oldMsg) await oldMsg.delete().catch(() => {});
+	}
+
+	// Track the active message
+	state.queueMessages.set(queueNumber, newMsg);
+	return newMsg;
+}
+
+/* --------------------------------------------
+ * Public: writeCustomQueue (INITIALIZE ONCE)
+ * ------------------------------------------ */
+
+async function writeCustomQueue(channel) {
+	const serverID = channel.guild.id;
+	const config = await Config.findOne({ serverID }) ?? new Config({ serverID });
+
+	// config defaults / timers
+	const perRoleCap = maybeNumber(config.PerRoleCapacity, 2);
+	const voteThreshold = maybeNumber(config.VoteThreshold, 6);
+	const voteTimeoutMs = maybeNumber(config.VoteTimeoutMs, 2 * 60 * 60 * 1000);
+	const deleteShortMs = maybeNumber(config.DeleteShortMs, 2000);
+	const deleteMediumMs = maybeNumber(config.DeleteMediumMs, 5000);
+	const deleteLongMs = maybeNumber(config.DeleteLongMs, 10000);
+
+	if (typeof config.QueueNumber !== 'number' || !Number.isFinite(config.QueueNumber)) {
+		config.QueueNumber = 1;
+	}
+	const queueNumber = config.QueueNumber;
+
+	const state = getGuildState(serverID);
+
+	// Initialize queue/channels/matches ONLY if missing
+	if (!state.queues.has(queueNumber)) state.queues.set(queueNumber, makeEmptyQueue());
+	if (!state.channels.has(queueNumber)) state.channels.set(queueNumber, {});
+	if (!state.matches.has(queueNumber)) state.matches.set(queueNumber, {});
+
+	const queue = state.queues.get(queueNumber);
+
+	// Clear the previous message (legacy) only on FIRST init
+	await clearPreviousMessage(channel, config).catch(() => {});
+
+	// Create UI at bottom (does NOT reset queue)
+	const queueMessage = await replaceQueueUIAtBottom(channel, config, queue, serverID, queueNumber);
+
+	// Done — collectors attached via replaceQueueUIAtBottom
+	return queueMessage;
+}
+
+/* --------------------------------------------
+ * Public: bump UI (NO RESET)
+ * Call this from messageCreate when someone chats in botChannel
+ * ------------------------------------------ */
+async function bumpQueueUI(channel) {
+	const serverID = channel.guild.id;
+	const config = await Config.findOne({ serverID }).catch(() => null);
+	if (!config) return;
+
+	const queueNumber = typeof config.QueueNumber === 'number' ? config.QueueNumber : 1;
+	const state = getGuildState(serverID);
+	const queue = state.queues.get(queueNumber);
+	if (!queue) return; // nothing active to render
+
+	await replaceQueueUIAtBottom(channel, config, queue, serverID, queueNumber);
+}
+
+/* --------------------------------------------
+ * Queue full -> play flow (unchanged, references existing state)
+ * ------------------------------------------ */
+
+async function onQueueFullFlow({ channel, config, serverID, queueNumber }) {
+	const deleteMediumMs = maybeNumber(config.DeleteMediumMs, 5000);
+	const deleteLongMs = maybeNumber(config.DeleteLongMs, 10000);
+	const voteThreshold = maybeNumber(config.VoteThreshold, 6);
+	const voteTimeoutMs = maybeNumber(config.VoteTimeoutMs, 2 * 60 * 60 * 1000);
+
+	const state = getGuildState(serverID);
+	const queue = state.queues.get(queueNumber);
+	const queueChannels = state.channels.get(queueNumber) ?? {};
+	const matches = state.matches.get(queueNumber) ?? {};
+
+	const mess = await channel.send({ content: 'The queue is now full! Starting the game...' }).catch(() => null);
+	setTimeout(async () => { try { if (mess) await mess.delete(); } catch {} }, deleteMediumMs);
+
+	let createdCategory = false;
+
+	const cleanupAll = async () => {
+		await wait(deleteLongMs);
+		await safeDelete(queueChannels.text);
+		if (createdCategory) await safeDelete(queueChannels.category);
+		state.queues.delete(queueNumber);
+		state.channels.delete(queueNumber);
+		state.matches.delete(queueNumber);
+		state.queueMessages.delete(queueNumber);
+	};
+
+	try {
+		// Reuse lobby VC's parent category if present
+		const lobbyVC = channel.guild.channels.cache.get(config.botVCchannel);
+		const parentCategory =
+			lobbyVC?.parent ?? (lobbyVC?.parentId ? channel.guild.channels.cache.get(lobbyVC.parentId) : null);
+
+		if (parentCategory && parentCategory.type === ChannelType.GuildCategory) {
+			queueChannels.category = parentCategory;
+		} else {
+			queueChannels.category = await createCategory(channel.guild, `Queue #${queueNumber}`);
+			createdCategory = true;
+			await moveCategoryToBottom?.(channel.guild, queueChannels.category).catch(() => {});
+		}
+
+		queueChannels.text = await createTextChannel(channel.guild, queueChannels.category, `Queue #${queueNumber}`);
+		queueChannels.voice = await createVoiceChannel(channel.guild, queueChannels.category, `Queue VC #${queueNumber}`);
+
+		await moveUsersToVoiceChannel(channel.guild, queueChannels.voice, config.botVCchannel, queue);
+
+		try {
+			const teams = await draftStart(queue, config, queueChannels, channel.guild, queueNumber);
+
+			matches.blue = await createVoiceChannel(channel.guild, queueChannels.category, `Blue VC #${queueNumber}`);
+			matches.red = await createVoiceChannel(channel.guild, queueChannels.category, `Red VC #${queueNumber}`);
+
+			await moveUsersToVoiceChannel(channel.guild, matches.blue, queueChannels.voice.id, teams.blue.picks);
+			await moveUsersToVoiceChannel(channel.guild, matches.red, queueChannels.voice.id, teams.red.picks);
+
+			await safeDelete(queueChannels.voice);
+
+			// Prepare next queue number but do NOT render/bump here
+			config.QueueNumber += 1;
+			await config.save().catch(() => {});
+			state.queues.set(config.QueueNumber, makeEmptyQueue());
+			state.channels.set(config.QueueNumber, {});
+			state.matches.set(config.QueueNumber, {});
+
+			const vote = await collectWinnerVoteFromTeams(queueChannels.text, {
+				teams,
+				threshold: voteThreshold,
+				timeoutMs: voteTimeoutMs,
+				blueName: 'Blue',
+				redName: 'Red',
+				prompt: 'Teams, please vote who won the match:',
+			});
+
+			const { points } = await applyMatchResult({
+				serverID,
+				teams,
+				winner: vote.winner,
+			});
+
+			await queueChannels.text.send({
+				embeds: [buildPointsUpdateEmbed(channel.guild, teams, points, vote.winner)],
+			});
+
+			const botVC = channel.guild.channels.cache.get(config.botVCchannel);
+			await moveUsersToVoiceChannel(channel.guild, botVC, matches.blue.id, teams.blue.picks);
+			await moveUsersToVoiceChannel(channel.guild, botVC, matches.red.id, teams.red.picks);
+
+			await safeDelete(matches.blue);
+			await safeDelete(matches.red);
+		} catch (err) {
+			await queueChannels.text?.send?.({ content: err?.message ?? 'Unexpected error during draft or match setup.' }).catch(() => {});
+			await wait(deleteMediumMs);
+
+			const botVC = channel.guild.channels.cache.get(config.botVCchannel);
+			if (queueChannels.voice) {
+				await moveUsersToVoiceChannel(channel.guild, botVC, queueChannels.voice.id, queue);
+			} else if (matches.blue || matches.red) {
+				try { if (matches.blue && err?.teams?.blue?.picks) await moveUsersToVoiceChannel(channel.guild, botVC, matches.blue.id, err.teams.blue.picks); } catch {}
+				try { if (matches.red && err?.teams?.red?.picks) await moveUsersToVoiceChannel(channel.guild, botVC, matches.red.id, err.teams.red.picks); } catch {}
+			}
+
+			await safeDelete(queueChannels.text);
+			await safeDelete(queueChannels.voice);
+			await safeDelete(matches.blue);
+			await safeDelete(matches.red);
+			if (createdCategory) await safeDelete(queueChannels.category);
+			return;
+		}
+	} finally {
+		await cleanupAll();
+	}
+}
+
+/* --------------------------------------------
+ * Exports
+ * ------------------------------------------ */
+module.exports = {
+	writeCustomQueue,   // call once to initialize a queue session for the current QueueNumber
+	bumpQueueUI,        // call on messageCreate in botChannel to keep the UI at bottom (no reset)
+};
