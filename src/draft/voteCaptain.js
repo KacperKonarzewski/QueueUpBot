@@ -1,3 +1,4 @@
+// startCaptainVote.js
 const { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, ComponentType, MessageFlags } = require('discord.js');
 const Player = require('../../models/Player');
 
@@ -114,7 +115,9 @@ const openPanelButton = () => {
 	);
 };
 
-//--------------------------------------------
+/* --------------------------------------------
+ * Public: startCaptainVote
+ * ------------------------------------------ */
 
 const startCaptainVote = async (textChannel, guild, queue, durationMs = 60000) => {
 	const ids = getQueueMemberIds(queue);
@@ -125,6 +128,7 @@ const startCaptainVote = async (textChannel, guild, queue, durationMs = 60000) =
 	const rows = await Player.find({ serverID: guild.id, discordID: { $in: ids } })
 		.select('discordID matchWins matchLosses')
 		.lean();
+
 	const gamesAmount = Object.fromEntries(
 		rows.map(({ discordID, matchWins, matchLosses }) => [
 			discordID,
@@ -139,19 +143,27 @@ const startCaptainVote = async (textChannel, guild, queue, durationMs = 60000) =
 			queue.Mid.includes(id) ? 'Mid' :
 			queue.Adc.includes(id) ? 'ADC' :
 			queue.Supp.includes(id) ? 'Support' : 'Unknown';
+
 		const m = guild.members.cache.get(id);
 		const raw = m?.displayName || m?.user?.username || id.slice(0, 10);
 		const label = raw.length > 28 ? raw.slice(0, 28) : raw;
+
 		return { id, lane, label };
 	});
 
 	const buckets = makeBuckets(candidates);
 
-	const votes = new Map();
-	const panels = new Map();
+	const votes = new Map();   // Map<voterId, string[0..2]>
+	const panels = new Map();  // Map<voterId, Message>
 
 	const endAt = Date.now() + durationMs;
+
+	// NEW: voting closed flag + a registry of all per-user panel collectors
+	let votingClosed = false;
+	const panelCollectors = new Set();
+
 	let lastEditAt = 0;
+
 	let message = await textChannel.send({
 		embeds: [buildVoteEmbed(candidates, votes, endAt, gamesAmount)],
 		components: [openPanelButton()]
@@ -162,7 +174,9 @@ const startCaptainVote = async (textChannel, guild, queue, durationMs = 60000) =
 		time: durationMs
 	});
 
+	// Guarded + throttled main-embed editor
 	const editMainEmbedThrottled = async () => {
+		if (votingClosed) return;
 		const now = Date.now();
 		if (now - lastEditAt < 1200) return;
 		lastEditAt = now;
@@ -172,6 +186,85 @@ const startCaptainVote = async (textChannel, guild, queue, durationMs = 60000) =
 			});
 		} catch {}
 	};
+
+	// Helper: attach collector to a voter's ephemeral panel (captures votingClosed & panelCollectors)
+	function attachPanelCollector({ panel, voterId }) {
+		const userCollector = panel.createMessageComponentCollector({
+			componentType: ComponentType.Button,
+			time: Math.max(0, endAt - Date.now()),
+			filter: ii => ii.user.id === voterId
+		});
+
+		panelCollectors.add(userCollector);
+
+		userCollector.on('collect', async (ii) => {
+			if (votingClosed) return;
+
+			if (!ii.deferred && !ii.replied) {
+				await ii.deferUpdate().catch(() => {});
+			}
+
+			const [kind, arg] = (ii.customId || '').split(':');
+
+			if (kind === 'vote') {
+				const candidateId = arg;
+				const picks = votes.get(voterId) || [];
+				const idx = picks.indexOf(candidateId);
+				if (idx >= 0) {
+					picks.splice(idx, 1);
+				} else {
+					if (picks.length >= 2) {
+						return ii.followUp({
+							content: '⚠️ You already selected 2 captains. Unselect one first.',
+							flags: MessageFlags.Ephemeral
+						}).catch(() => {});
+					}
+					picks.push(candidateId);
+				}
+				votes.set(voterId, picks);
+
+				const comps = [
+					...buildVoteButtons(buckets, picks),
+					buildQuickRoleRow(buckets, picks)
+				];
+
+				try {
+					await panel.edit({
+						content: `Your current votes: ${picks.map(id => `<@${id}>`).join(', ') || 'none'}`,
+						components: comps
+					});
+				} catch {}
+				return editMainEmbedThrottled();
+			}
+
+			if (kind === 'rolepick') {
+				const role = arg;
+				const pair = (buckets[role] || []).map(c => c.id).slice(0, 2);
+				const picks = pair;
+				votes.set(voterId, picks);
+
+				const comps = [
+					...buildVoteButtons(buckets, picks),
+					buildQuickRoleRow(buckets, picks)
+				];
+
+				try {
+					await panel.edit({
+						content: `Your current votes: ${picks.map(id => `<@${id}>`).join(', ') || 'none'}`,
+						components: comps
+					});
+				} catch {}
+				return editMainEmbedThrottled();
+			}
+		});
+
+		userCollector.on('end', async () => {
+			try { await panel.edit({ components: [] }); } catch {}
+			panelCollectors.delete(userCollector);
+		});
+
+		return userCollector;
+	}
 
 	collector.on('collect', async (i) => {
 		if (!i.deferred && !i.replied) {
@@ -183,117 +276,62 @@ const startCaptainVote = async (textChannel, guild, queue, durationMs = 60000) =
 		}
 
 		if (i.customId === 'open_panel') {
+			if (votingClosed) {
+				return i.followUp({ content: '🛑 Voting is already closed.', flags: MessageFlags.Ephemeral }).catch(() => {});
+			}
+
 			const voterId = i.user.id;
 			if (!votes.has(voterId)) votes.set(voterId, []);
 
 			const picks = votes.get(voterId);
-			const existing = panels.get(voterId);
-
 			const components = [
 				...buildVoteButtons(buckets, picks),
 				buildQuickRoleRow(buckets, picks)
 			];
 
-			if (existing) {
+			let panel = panels.get(voterId);
+
+			// If we already have a panel, update it instead of spawning a new one
+			if (panel?.editable) {
 				try {
-					await i.followUp({
+					if (votingClosed) return;
+					await panel.edit({
 						content: `Your current votes: ${picks.map(id => `<@${id}>`).join(', ') || 'none'}`,
-						components,
-						flags: MessageFlags.Ephemeral
+						components
 					});
 				} catch {
-					const panel = await i.followUp({
-						content: `Your current votes: ${picks.map(id => `<@${id}>`).join(', ') || 'none'}`,
-						components,
-						flags: MessageFlags.Ephemeral,
-						fetchReply: true
-					}).catch(() => null);
-					if (panel) panels.set(voterId, panel);
+					panel = null; // fallback to recreate
 				}
-			} else {
-				const panel = await i.followUp({
+			}
+
+			// Create if missing or failed to edit
+			if (!panel) {
+				panel = await i.followUp({
 					content: `Your current votes: ${picks.map(id => `<@${id}>`).join(', ') || 'none'}`,
 					components,
 					flags: MessageFlags.Ephemeral,
 					fetchReply: true
 				}).catch(() => null);
-				if (panel) panels.set(voterId, panel);
 
 				if (panel) {
-					const userCollector = panel.createMessageComponentCollector({
-						componentType: ComponentType.Button,
-						time: Math.max(0, endAt - Date.now()),
-						filter: ii => ii.user.id === voterId
-					});
-
-					userCollector.on('collect', async (ii) => {
-						if (!ii.deferred && !ii.replied) {
-							await ii.deferUpdate().catch(() => {});
-						}
-
-						const [kind, arg] = ii.customId.split(':');
-
-						if (kind === 'vote') {
-							const candidateId = arg;
-							const picks = votes.get(voterId) || [];
-							const idx = picks.indexOf(candidateId);
-							if (idx >= 0) {
-								picks.splice(idx, 1);
-							} else {
-								if (picks.length >= 2) {
-									return ii.followUp({ content: '⚠️ You already selected 2 captains. Unselect one first.', flags: MessageFlags.Ephemeral }).catch(() => {});
-								}
-								picks.push(candidateId);
-							}
-							votes.set(voterId, picks);
-
-							const comps = [
-								...buildVoteButtons(buckets, picks),
-								buildQuickRoleRow(buckets, picks)
-							];
-
-							try {
-								await panel.edit({
-									content: `Your current votes: ${picks.map(id => `<@${id}>`).join(', ') || 'none'}`,
-									components: comps
-								});
-							} catch {}
-							return editMainEmbedThrottled();
-						}
-
-						if (kind === 'rolepick') {
-							const role = arg;
-							const pair = (buckets[role] || []).map(c => c.id).slice(0, 2);
-							const picks = pair;
-							votes.set(voterId, picks);
-
-							const comps = [
-								...buildVoteButtons(buckets, picks),
-								buildQuickRoleRow(buckets, picks)
-							];
-
-							try {
-								await panel.edit({
-									content: `Your current votes: ${picks.map(id => `<@${id}>`).join(', ') || 'none'}`,
-									components: comps
-								});
-							} catch {}
-							return editMainEmbedThrottled();
-						}
-					});
-
-					userCollector.on('end', async () => {
-						try { await panel.edit({ components: [] }); } catch {}
-					});
+					panels.set(voterId, panel);
+					attachPanelCollector({ panel, voterId });
 				}
 			}
+
 			return editMainEmbedThrottled();
 		}
-
 	});
 
 	return await new Promise((resolve) => {
 		collector.on('end', async () => {
+			votingClosed = true;
+
+			for (const c of panelCollectors) {
+				try { c.stop('main_ended'); } catch {}
+			}
+			panelCollectors.clear();
+
 			const counts = tallyVotes(candidates, votes);
 			const sorted = [...counts.entries()].sort((a, b) => {
 				if (b[1] !== a[1]) return b[1] - a[1];
@@ -313,6 +351,10 @@ const startCaptainVote = async (textChannel, guild, queue, durationMs = 60000) =
 			try {
 				await message.edit({ embeds: [finalEmbed], components: [] });
 			} catch {}
+
+			setTimeout(async () => {
+				try { await message.edit({ embeds: [finalEmbed], components: [] }); } catch {}
+			}, 300);
 
 			resolve(top2);
 		});

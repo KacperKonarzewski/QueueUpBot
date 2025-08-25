@@ -2,7 +2,7 @@ const { ChannelType, PermissionsBitField } = require('discord.js');
 
 const moveUserToChannel = async (member, channel) => {
 	try {
-		if (member && channel && channel.type === ChannelType.GuildVoice) {
+		if (member && member.voice?.channel && channel && channel.type === ChannelType.GuildVoice) {
 			await member.voice.setChannel(channel);
 		}
 	} catch (err) {

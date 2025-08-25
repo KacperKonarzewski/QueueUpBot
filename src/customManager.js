@@ -506,9 +506,9 @@ async function onQueueFullFlow({ channel, config, serverID, queueNumber }) {
 	};
 
 	try {
-		const lobbyVC = channel.guild.channels.cache.get(config.botChannel);
+		const lobby = channel.guild.channels.cache.get(config.botChannel);
 		const parentCategory =
-			lobbyVC?.parent ?? (lobbyVC?.parentId ? channel.guild.channels.cache.get(lobbyVC.parentId) : null);
+			lobby?.parent ?? (lobby?.parentId ? channel.guild.channels.cache.get(lobby.parentId) : null);
 
 		if (parentCategory && parentCategory.type === ChannelType.GuildCategory) {
 			queueChannels.category = parentCategory;
@@ -539,6 +539,8 @@ async function onQueueFullFlow({ channel, config, serverID, queueNumber }) {
 			state.queues.set(config.QueueNumber, makeEmptyQueue());
 			state.channels.set(config.QueueNumber, {});
 			state.matches.set(config.QueueNumber, {});
+
+			await replaceQueueUIAtBottom(channel, config, state.queues.get(config.QueueNumber), serverID, config.QueueNumber);
 
 			const vote = await collectWinnerVoteFromTeams(queueChannels.text, {
 				teams,

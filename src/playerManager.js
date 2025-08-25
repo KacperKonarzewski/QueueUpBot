@@ -20,12 +20,13 @@ const addPlayerIfNotExists = async (member) => {
 
 //------------------------------------
 
-const K_POINTS = 80;
-const D_POINTS = 400;
+const K_POINTS = 80;   // Elo K for visible points
+const D_POINTS = 400;  // Elo scale for visible points
 
-const D_MMR = 400;
-const PRIOR_BETA = 20;
+const D_MMR = 400;     // Elo scale for hidden MMR
+const PRIOR_BETA = 20; // Beta prior weight for winrate smoothing
 
+// Smooth K for hidden MMR: higher K for first 10 games, then decays toward a floor.
 const kHiddenFromGames = (games) => {
 	const g = Math.max(0, games);
 	if (g < 10) {
@@ -42,23 +43,27 @@ const teamIds = (teams, key) => {
 	return ROLE_ORDER.map(r => teams[key]?.picks?.[r]).filter(Boolean);
 };
 
+// Classic Elo expected score
 const expectedScore = (muA, muB, d) => {
 	return 1 / (1 + Math.pow(10, (muB - muA) / d));
 };
 
+// Bayesian-smoothed winrate
 const smoothedWinrate = (wins, games, beta = PRIOR_BETA) => {
 	return (wins + 0.5 * beta) / (games + beta);
 };
 
+// Non-linear ±60% multiplier around 1.0 based on winrate
 const mmrMultiplier60 = (wins, games, gamma = 1.5) => {
 	const w = smoothedWinrate(wins ?? 0, games ?? 0);
-	const x = 2 * w - 1;
+	const x = 2 * w - 1; // [-1..+1]
 	const f = Math.sign(x) * Math.pow(Math.abs(x), gamma);
 	const amp = 0.6;
 	const m = 1 + amp * f;
 	return Math.min(1 + amp, Math.max(1 - amp, m));
 };
 
+// Bridge multiplier to keep points and hiddenMMR aligned (caps influence by ±cap)
 const bridgeFromGapSigned = (hidden, points, unit, { cap = 0.50, scale = 100 } = {}) => {
 	const gap = (hidden ?? 500) - (points ?? 500);
 	const t = Math.tanh(gap / scale);
@@ -91,36 +96,39 @@ const applyMatchResult = async ({ serverID, teams, winner }) => {
 	const losses = id => (byId[id]?.matchLosses ?? 0);
 	const games = id => wins(id) + losses(id);
 
+	// -------- Points (per-player expected score vs opponent average) --------
 	const muBlue_points = blueIds.reduce((a, id) => a + rating(id), 0) / N;
-	const muRed_points = redIds.reduce((a, id) => a + rating(id), 0) / N;
-	const Eblue_points = expectedScore(muBlue_points, muRed_points, D_POINTS);
-	const Sblue = winner === 'blue' ? 1 : 0;
-
-	const unitBlue_points = K_POINTS * (Sblue - Eblue_points);
-	const unitRed_points = -unitBlue_points;
-
-	const mBlue_points = blueIds.map(id =>
-		clamp(bridgeFromGapSigned(h(id), rating(id), unitBlue_points, { cap: 0.50, scale: 100 }), 0.5, 1.5)
-	);
-	const mRed_points = redIds.map(id =>
-		clamp(bridgeFromGapSigned(h(id), rating(id), unitRed_points, { cap: 0.50, scale: 100 }), 0.5, 1.5)
-	);
-
-	const sumMB = mBlue_points.reduce((a, b) => a + b, 0);
-	const sumMR = mRed_points.reduce((a, b) => a + b, 0);
+	const muRed_points  = redIds.reduce((a, id) => a + rating(id), 0) / N;
 
 	const deltasPoints = {};
-	blueIds.forEach((id, i) => {
-		deltasPoints[id] = unitBlue_points * (N * mBlue_points[i] / sumMB);
-	});
-	redIds.forEach((id, i) => {
-		deltasPoints[id] = unitRed_points * (N * mRed_points[i] / sumMR);
-	});
-	Object.keys(deltasPoints).forEach(id => { deltasPoints[id] = Math.round(deltasPoints[id]); });
+
+	// Blue players: compare to RED team average
+	for (const id of blueIds) {
+		const S    = (winner === 'blue') ? 1 : 0;
+		const E    = expectedScore(rating(id), muRed_points, D_POINTS);
+		const unit = K_POINTS * (S - E); // personal unit
+		const mult = clamp(
+			bridgeFromGapSigned(h(id), rating(id), unit, { cap: 0.50, scale: 100 }),
+			0.5, 1.5
+		);
+		deltasPoints[id] = Math.round(unit * mult);
+	}
+
+	// Red players: compare to BLUE team average
+	for (const id of redIds) {
+		const S    = (winner === 'red') ? 1 : 0;
+		const E    = expectedScore(rating(id), muBlue_points, D_POINTS);
+		const unit = K_POINTS * (S - E);
+		const mult = clamp(
+			bridgeFromGapSigned(h(id), rating(id), unit, { cap: 0.50, scale: 100 }),
+			0.5, 1.5
+		);
+		deltasPoints[id] = Math.round(unit * mult);
+	}
 
 	// -------- Hidden MMR (smooth K + non-linear ±60% personal) --------
 	const muBlue_hidden = blueIds.reduce((a, id) => a + h(id), 0) / N;
-	const muRed_hidden = redIds.reduce((a, id) => a + h(id), 0) / N;
+	const muRed_hidden  = redIds.reduce((a, id) => a + h(id), 0) / N;
 
 	const deltasHidden = {};
 	for (const id of allIds) {
