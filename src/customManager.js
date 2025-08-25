@@ -506,7 +506,7 @@ async function onQueueFullFlow({ channel, config, serverID, queueNumber }) {
 	};
 
 	try {
-		const lobbyVC = channel.guild.channels.cache.get(config.botVCchannel);
+		const lobbyVC = channel.guild.channels.cache.get(config.botChannel);
 		const parentCategory =
 			lobbyVC?.parent ?? (lobbyVC?.parentId ? channel.guild.channels.cache.get(lobbyVC.parentId) : null);
 

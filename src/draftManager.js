@@ -5,8 +5,8 @@ const { createDraftLinks } = require('./draft/draftLol');
 
 const waitForMembersInChannel = async (members, channels, queueNumber, timeoutMs = 300000) => {
 	return new Promise(async (resolve, reject) => {
-		const textChannel = channels['text' + queueNumber];
-		const voiceChannel = channels['voice' + queueNumber];
+		const textChannel = channels.text ?? channels['text' + queueNumber];
+		const voiceChannel = channels.voice ?? channels['voice' + queueNumber];
 
 		if (!textChannel || !voiceChannel) {
 			return reject(new Error('❌ Draft channels are missing.'));
@@ -124,13 +124,13 @@ const draftStart = async (queue, config, channels, guild, queueNumber) => {
 
 		await waitForMembersInChannel(members, channels, queueNumber, waitMs);
 
-		const captains = await startCaptainVote(channels['text' + queueNumber], guild, queue, voteMs);
+		const captains = await startCaptainVote(channels.text, guild, queue, voteMs);
 
-		const teams = await startCaptainDraft(channels['text' + queueNumber], queue, captains);
+		const teams = await startCaptainDraft(channels.text, queue, captains);
 
 		try {
 			const links = await createDraftLinks();
-			await sendDraftLinks(channels['text' + queueNumber], links);
+			await sendDraftLinks(channels.text, links);
 		} catch (e) {
 			console.error('createDraftLinks/sendDraftLinks failed:', e?.message || e);
 		}
